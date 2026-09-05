@@ -25,8 +25,8 @@ DSH 0.1.2-rc.1 的 `@deepseek-ai/dsh-settings` 移除了 `settingsNamespace` 导
 ## 安装（DSH）
 
 ```sh
-# 仓库就绪后，替换官方 GitHub 源安装：
-dsh plugin --profile web add git+https://gitee.com/xingchendahai1/dsh-opencode-go-pool.git
+# 仓库就绪后安装（GitHub 源）：
+dsh plugin --profile web add git+https://github.com/join123-bit/dsh-opencode-go-pool.git
 ```
 
 在 `$DSH_HOME/profiles/web/cordis.patch.yml` 挂载（注意：新版 loader 必须用 `insert:` 格式，

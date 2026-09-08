@@ -1,0 +1,21 @@
+# dsh-opencode-go-pool bundle patch — auto-mounted by `dsh plugin add`.
+#
+# Declared through package.json `dsh.bundle.patch`; once the package is a
+# dependency, `dsh plugin` reconcile() appends this package to the profile's
+# `dsh.profile.bundles` layer stack and every boot composes this file as one
+# insert layer. The user-level cordis.patch.yml applies afterwards (last write
+# wins per row), so remove any hand-written opencode-go-pool row there.
+- insert:
+    - id: opencode-go-pool
+      name: 'dsh-opencode-go-pool'
+      config:
+        route: opencode-go          # 接管官方路由；冲突时休眠等待接管
+        keys: []                    # 初始为空，由设置卡片管理（也可在此预置）
+        headers:                    # v0.1.12+：透传请求头，OpenCode Go 必需
+          x-opencode-session: dsh-opencode-go-session
+        preemptAtPercent: 100
+        modelMode: all
+        models: []
+        usageBaseUrl: https://opencode.ai/zen/go/v1/usage
+        usageRefreshMs: 30000
+        timeoutMs: 15000

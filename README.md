@@ -17,20 +17,30 @@ DeepSeek Harness（DSH）插件：**OpenCode Go 套餐的多 Key 池** —— �
 | 🗂 模型选择 | 卡片内勾选该路由暴露哪些模型：「全部模型」跟随官方目录；自定义时未勾选的模型不出现在聊天模型下拉、也无法发起请求；默认折叠，点「展开」查看 |
 | 📥 拉取最新模型 | 卡片内「拉取模型」从官方 `models` 接口抓取供应商最新模型列表；目录里还没有的新模型即时进入可选列表（按默认协议接入，勾选即可尝试） |
 
-## 安装
+## 安装（v0.1.13 起自动挂载，一条命令）
+
+本包声明了 `dsh.bundle.patch`（包内 `cordis.patch.yml`）：`dsh plugin add` 安装后，
+DSH 会自动把它追加进 profile 的 `dsh.profile.bundles` 层栈并随启动自动挂载——
+**无需手写任何挂载行**。
 
 ```sh
-# 本仓库是 DSH 0.1.2-rc.x 兼容补丁版 fork，安装用本仓库地址并锁定 commit（见「版本锁定」）：
 dsh plugin --profile web add github:join123-bit/dsh-opencode-go-pool#<commit-sha>
 ```
 
-重启 DSH（插件变更需重启生效）。随后：
+之后：
+
+1. 确认自动挂载生效：`cat "$DSH_HOME/profiles/web/package.json"` 中
+   `dsh.profile.bundles` 应包含 `dsh-opencode-go-pool`；
+2. **删除**（若有）`$DSH_HOME/profiles/web/cordis.patch.yml` 里手工写的
+   `opencode-go-pool` 行——用户 patch 晚于 bundle 层、按行覆盖，重复写会以你
+   的手工行为准，容易与升级后的默认配置偏离；
+3. 重启 DSH（插件变更需重启生效）。随后：
 
 1. **迁移**：打开「设置 → 模型」，删除 `opencode-go` 供应商行（本插件会自动接管该路由；未删除时插件保持休眠并在卡片中显示引导）。
 2. **配置 Key**：打开「设置 → OpenCode Go 套餐池」→「Key 管理」，为每个账号添加一行（id 自动生成；label 为显示名；凭据引用填环境变量名，如 `OPENCODE_GO_KEY_A`）。
 3. **填写密钥**：把每个 Key 的明文写入凭据页（设置 → 模型 → 凭据，对应环境变量名），或 `~/.dsh/.credentials.yaml` / 环境变量。**明文 Key 永不进入插件配置、日志或任何 RPC 响应。**
 
-### 手工安装（等价步骤）
+### 手工安装（等价步骤，仅当不用 `dsh plugin` 时）
 
 `$DSH_HOME/profiles/web/cordis.patch.yml` 加入插件行：
 

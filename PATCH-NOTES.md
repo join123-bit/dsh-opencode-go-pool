@@ -63,11 +63,28 @@ DSH 0.1.2-rc.1 的 `@deepseek-ai/dsh-settings` 移除了 `settingsNamespace` 导
       x-opencode-session: dsh-opencode-go-session
 ```
 
+## v0.1.13 —— bundle 自动挂载（2026-09-08）
+
+**不再需要手写 cordis.patch.yml 挂载行。**
+
+- 包内新增 `cordis.patch.yml`（insert: 格式，含默认 config：route/keys/headers/
+  preemptAtPercent/modelMode/models/usageBaseUrl/usageRefreshMs/timeoutMs）；
+- package.json 声明 `dsh.bundle.patch: './cordis.patch.yml'`。`dsh plugin add`
+  安装后，DSH 的 reconcile 机制会把这个包自动追加到 profile 的
+  `dsh.profile.bundles` 层栈，每次启动自动合并挂载。
+- 安装后检查：`~/.dsh/profiles/web/package.json` 的 `dsh.profile.bundles` 应包含
+  `dsh-opencode-go-pool`；然后把用户 `cordis.patch.yml` 里的同名手工行删掉
+  （用户层晚于 bundle 层且按行覆盖，保留手工行会覆盖 bundle 默认 config）。
+- 版本锁定仍推荐：`dsh plugin --profile web add github:join123-bit/dsh-opencode-go-pool#<sha>`。
+
 ## 安装（DSH）
 
+> **v0.1.13 起自动挂载**：`dsh plugin add` 后插件自动进入 profile bundles，无需
+> 下面的手工挂载（保留手工行会被用户层覆盖 bundle 默认配置，建议删除）。
+
 ```sh
-# 仓库就绪后安装（GitHub 源）：
-dsh plugin --profile web add git+https://github.com/join123-bit/dsh-opencode-go-pool.git
+# 仓库就绪后安装（GitHub 源，锁 commit）：
+dsh plugin --profile web add github:join123-bit/dsh-opencode-go-pool#<sha>
 ```
 
 在 `$DSH_HOME/profiles/web/cordis.patch.yml` 挂载（注意：新版 loader 必须用 `insert:` 格式，

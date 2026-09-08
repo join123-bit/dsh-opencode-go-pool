@@ -48,6 +48,84 @@ import {
 
 export const name = 'opencode-go-pool'
 
+/**
+ * Upgrade-resilience layer (v0.1.11, on top of the 0.1.2 settingsNamespace fix).
+ *
+ * DSH ships only rc/alpha releases while its plugin contracts are still
+ * moving. Instead of crashing activation when an upstream API is renamed,
+ * removed, or reshaped, the plugin probes every integration point it relies
+ * on before touching any registry:
+ *   - module level: the imported classes/functions exist and return sane
+ *     shapes (no ctx needed, reused by smoke.mjs);
+ *   - service level: the runtime still exposes llm.registerAdapter /
+ *     settings.register / credentials.resolve.
+ * A failed probe turns the plugin dormant: nothing is registered, nothing
+ * crashes, the reason is logged and surfaced through status().takeoverHint
+ * (the Settings card shows it), so a DSH upgrade degrades the plugin into a
+ * visible "waiting" state instead of taking the host down with it. The
+ * official single-key route keeps serving untouched while the plugin sleeps.
+ */
+
+const CORE_FNS = [
+  ['TypertRemoteService', TypertRemoteService],
+  ['credentialRef', credentialRef],
+  ['assertUsableApiKey', assertUsableApiKey],
+  ['resolveRetryPolicy', resolveRetryPolicy],
+  ['opencodeGoProvider', opencodeGoProvider],
+  ['PiAiAdapter', PiAiAdapter],
+]
+
+/** Module-level probe: no ctx required. Empty array = all integration points OK. */
+export function probeCoreImports() {
+  const issues = []
+  for (const [label, value] of CORE_FNS) {
+    if (typeof value !== 'function') issues.push(`${label} is not a function (got ${String(value)})`)
+  }
+  if (issues.length === 0) {
+    try {
+      const provider = opencodeGoProvider()
+      if (!provider || typeof provider.getModels !== 'function') {
+        issues.push('opencodeGoProvider() returned no getModels()')
+      } else if (typeof provider.id !== 'string') {
+        issues.push('opencodeGoProvider() returned no string id')
+      }
+    } catch (error) {
+      issues.push(`opencodeGoProvider() threw: ${String((error && error.message) || error)}`)
+    }
+    try {
+      // Constructions are synchronous and side-effect free in 0.1.2-rc.1;
+      // a throw here means the constructor contract moved.
+      new PiAiAdapter({
+        profiles: () => new Map(),
+        resolveApiKey: async () => '',
+        resolveAttachments: () => undefined,
+      })
+    } catch (error) {
+      issues.push(`PiAiAdapter cannot be constructed: ${String((error && error.message) || error)}`)
+    }
+  }
+  return issues
+}
+
+/** Service-level probe: the runtime services the plugin binds to. */
+export function selfCheck(ctx) {
+  const issues = [...probeCoreImports()]
+  if (!ctx || typeof ctx.on !== 'function') issues.push('ctx.on is missing (not a Cordis context)')
+  const llm = ctx?.get ? ctx.get('llm') : ctx?.llm
+  if (!llm || typeof llm.registerAdapter !== 'function') {
+    issues.push('llm service: registerAdapter missing (llm absent or renamed)')
+  }
+  const settings = ctx?.get ? ctx.get('settings') : ctx?.settings
+  if (!settings || typeof settings.register !== 'function') {
+    issues.push('settings service: register missing (settings absent or renamed)')
+  }
+  const credentials = ctx?.get ? ctx.get('credentials') : ctx?.credentials
+  if (credentials && typeof credentials.resolve !== 'function') {
+    issues.push('credentials service: resolve missing')
+  }
+  return issues
+}
+
 const NS = 'opencode-go-pool'
 const DISPLAY_NAME = 'OpenCode Zen Go（池）'
 const DEFAULT_ROUTE = 'opencode-go'
@@ -274,11 +352,33 @@ export class OpenCodeGoPool extends TypertRemoteService {
     this.ctx = ctx
     this.logger = ctx.logger ?? console
 
-    this.scope = ctx.settings.register(NS, Config, {
-      base: config ?? {},
-      validate: validateSection,
-    })
-    this.current = () => this.scope.get()
+    // Probe every integration point before touching any registry. A failed
+    // probe leaves the plugin dormant instead of crashing activation; the
+    // official single-key route keeps serving untouched while it sleeps.
+    this.integrationIssues = []
+    try {
+      this.integrationIssues = selfCheck(ctx)
+    } catch (error) {
+      this.integrationIssues = [`integration probe crashed: ${String((error && error.message) || error)}`]
+    }
+    this.dormant = this.integrationIssues.length > 0
+    if (this.dormant) {
+      this.logger?.warn?.(`[opencode-go-pool] integration probe failed — plugin stays dormant: ${this.integrationIssues.join('; ')}`)
+    }
+
+    this.scope = null
+    this.current = () => ({})
+    try {
+      this.scope = ctx.settings.register(NS, Config, {
+        base: config ?? {},
+        validate: validateSection,
+      })
+      this.current = () => this.scope.get()
+    } catch (error) {
+      this.integrationIssues.push(`settings.register threw: ${String((error && error.message) || error)}`)
+      this.dormant = true
+      this.logger?.warn?.(`[opencode-go-pool] settings namespace unavailable — plugin stays dormant: ${this.integrationIssues.join('; ')}`)
+    }
 
     this.pool = new KeyPool({
       stateFile: dshHomePath('opencode-go-pool.state.json'),
@@ -301,6 +401,8 @@ export class OpenCodeGoPool extends TypertRemoteService {
     this.servingRoute = null
     this.lastTakeoverError = null
     this.lastModelSelection = null
+
+    if (this.dormant) return
 
     this.applyConfig()
     this.scope.watch(() => this.applyConfig())
@@ -548,14 +650,16 @@ export class OpenCodeGoPool extends TypertRemoteService {
     return {
       takeover: this.takeoverState(),
       route: this.servingRoute ?? cfg.route,
-      usageRefreshMs: cfg.usageRefreshMs,
-      preemptAtPercent: cfg.preemptAtPercent,
-      switchAfterConsecutiveFailures: cfg.switchAfterConsecutiveFailures,
+      usageRefreshMs: cfg.usageRefreshMs ?? DEFAULT_USAGE_REFRESH_MS,
+      preemptAtPercent: cfg.preemptAtPercent ?? 100,
+      switchAfterConsecutiveFailures: cfg.switchAfterConsecutiveFailures ?? 0,
       modelMode: cfg.modelMode ?? 'all',
       availableModels,
       activeId: this.pool.activeId,
       lastSwitch: this.pool.lastSwitch,
-      takeoverHint: this.servingRoute ? null : this.lastTakeoverError,
+      takeoverHint: this.dormant
+        ? `integration probe failed: ${this.integrationIssues.join('; ')}`
+        : (this.servingRoute ? null : this.lastTakeoverError),
       keys: entries.map(entry => {
         const st = this.pool.stateOf(entry.id)
         const result = usageResults.find(item => item.id === entry.id)

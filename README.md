@@ -20,7 +20,8 @@ DeepSeek Harness（DSH）插件：**OpenCode Go 套餐的多 Key 池** —— �
 ## 安装
 
 ```sh
-dsh plugin --profile web add github:whitelonng/dsh-opencode-go-pool
+# 本仓库是 DSH 0.1.2-rc.x 兼容补丁版 fork，安装用本仓库地址并锁定 commit（见「版本锁定」）：
+dsh plugin --profile web add github:join123-bit/dsh-opencode-go-pool#<commit-sha>
 ```
 
 重启 DSH（插件变更需重启生效）。随后：
@@ -130,6 +131,53 @@ node --test test/*.test.mjs
 - **多账号使用请自行确认符合 OpenCode 服务条款**；本插件只提供技术能力。
 - 全池耗尽时对话会收到明确的额度错误，卡片会全红显示；5h 窗口重置后自动恢复。
 - 每 Key 每次静默重试会重复计费输入 token（额度失败本身不计费），成本上限 = 池大小 × 单请求。
+
+## 稳定性：升级 DSH 后怎么办
+
+DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-settings` / `dsh-llm-pi-ai` 等）随时可能改名、删名或改形。本仓库 **v0.1.11 起**内置**集成点探针 + 休眠降级**：
+
+- 启动时先探测所有依赖的 DSH 接口：模块导入、`opencodeGoProvider()` / `PiAiAdapter` 构造契约、`llm` / `settings` / `credentials` 服务方法；
+- 探测失败 → 插件**休眠**：不接管路由、不抛错、官方单 Key 路由照常服务；原因写入日志，并显示在设置卡片的 `takeoverHint` 上；
+- 这样 DSH 升级对插件的影响从"启动即崩 / 拖垮 host"降级为"可见的休眠状态"。
+
+### 升级 DSH 后的三步检查
+
+1. **冒烟**（跑通过再信任插件）：
+
+   ```sh
+   cd "$DSH_HOME/profiles/web" && node node_modules/dsh-opencode-go-pool/smoke.mjs
+   ```
+
+   全部 `PASS` 再继续；`FAIL` 行就是被改动的接口名。
+2. **重启 DSH**，打开「设置 → OpenCode Go 套餐池」：卡片正常显示 Key 状态/用量 = 插件接管正常。
+3. **验证路由接管**：删除官方 `opencode-go` 行后发一条对话请求，确认走池（Key 轮换时卡片 `lastSwitch` 更新）。若卡片显示 `integration probe failed: …`，插件在休眠态——按 FAIL 内容看 DSH changelog 适配，或回滚 DSH 版本后重启，**不要原地反复重试启用**。
+
+### 兼容矩阵
+
+| DSH 版本 | 插件版本 | 模块探针 | 路由接管 | 设置卡片 | 备注 |
+|---|---|---|---|---|---|
+| 0.1.2-rc.1 | 0.1.10 / 0.1.11 | ✅（0.1.11 起） | ✅ Windows 实测 | ✅ Windows 实测 | `settingsNamespace` 补丁基线；macOS 待复测 |
+| 0.1.3-alpha.* | 未适配 | ⚠️ 升级前先跑 `smoke.mjs` | — | — | 探针会把它打成休眠而非崩溃 |
+
+每次 DSH 升级后更新此表：新版本号 → 跑 smoke → 适配 → 记录结果。
+
+### 版本锁定（防止安装漂移）
+
+git 依赖**必须锁 commit**，升级是显式动作、可回滚：
+
+```sh
+dsh plugin --profile web add github:join123-bit/dsh-opencode-go-pool#<commit-sha>
+```
+
+或 profile 的 `package.json`：
+
+```json
+"dependencies": {
+  "dsh-opencode-go-pool": "github:join123-bit/dsh-opencode-go-pool#<commit-sha>"
+}
+```
+
+不要用不带 sha 的 git 依赖——每次重装都会漂到该分支最新代码，你验证过的组合就失效了。
 
 ## 许可证
 

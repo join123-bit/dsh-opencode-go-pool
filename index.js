@@ -159,6 +159,7 @@ export const Config = z.object({
   // (new models appear automatically); 'custom' exposes exactly `models`.
   modelMode: z.union(['all', 'custom']).default('all'),
   models: z.array(z.string()).default([]),
+  headers: z.dict(z.string()).default({}),
   usageBaseUrl: z.string().default(DEFAULT_USAGE_BASE_URL),
   modelsBaseUrl: z.string().default(DEFAULT_MODELS_BASE_URL),
   usageRefreshMs: z.number().min(5000).max(300000).default(DEFAULT_USAGE_REFRESH_MS),
@@ -179,7 +180,7 @@ function validateSection(value) {
  * appending freshly pulled descriptors makes new supplier models usable
  * without a pi-ai package release. Known (shipped) models are never touched.
  */
-function buildProfile(route, dynamicDescriptors) {
+function buildProfile(route, dynamicDescriptors, headers = {}) {
   const upstream = opencodeGoProvider()
   if (upstream.id !== route) upstream.id = route
   const provider = {
@@ -195,6 +196,7 @@ function buildProfile(route, dynamicDescriptors) {
     displayName: DISPLAY_NAME,
     streamIdleTimeoutMs: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
     retryPolicy: resolveRetryPolicy(undefined, 'opencode-go-pool.catalog.retryPolicy'),
+    headers: { ...headers },
     piProvider: provider,
     configuredMaxTokens: new Map(),
     // Newer llm-pi-ai builds read modelCapabilities in listModels; a catalog
@@ -393,6 +395,10 @@ export class OpenCodeGoPool extends TypertRemoteService {
     // Injectable fetch for refreshModels; undefined = the host fetch.
     this.fetchModelsImpl = undefined
 
+    // Per-key PiAiAdapter cache: avoids rebuilding the pi-ai model collection
+    // on every stream attempt (the official route reuses one adapter).
+    this.attemptAdapterCache = new Map()
+
     this.profileRoute = null
     this.profileMap = null
     this.innerCatalog = null
@@ -416,13 +422,16 @@ export class OpenCodeGoPool extends TypertRemoteService {
 
   applyConfig() {
     const cfg = this.current()
+    // Config changes may alter route, headers, or key credential references;
+    // drop cached per-key adapters so they pick up the new settings.
+    this.attemptAdapterCache.clear()
     this.pool.setPreempt(cfg.preemptAtPercent)
     this.pool.setConsecutiveThreshold(cfg.switchAfterConsecutiveFailures)
     this.pool.syncKeys(cfg.keys)
 
     if (this.profileRoute !== cfg.route) {
       this.profileRoute = cfg.route
-      this.profileMap = new Map([[cfg.route, buildProfile(cfg.route, route => this.dynamicModelDescriptors(route))]])
+      this.profileMap = new Map([[cfg.route, buildProfile(cfg.route, route => this.dynamicModelDescriptors(route), cfg.headers)]])
       this.innerCatalog = new PiAiAdapter({
         profiles: () => this.profileMap,
         resolveApiKey: async () => {
@@ -509,11 +518,16 @@ export class OpenCodeGoPool extends TypertRemoteService {
 
   /** Per-attempt adapter bound to one key: no cross-attempt key races. */
   makeAttemptAdapter(entry) {
-    return new PiAiAdapter({
-      profiles: () => this.profileMap,
-      resolveApiKey: () => this.resolveKeyValue(entry),
-      resolveAttachments: () => this.ctx.get('attachments'),
-    })
+    let adapter = this.attemptAdapterCache.get(entry.id)
+    if (!adapter) {
+      adapter = new PiAiAdapter({
+        profiles: () => this.profileMap,
+        resolveApiKey: () => this.resolveKeyValue(entry),
+        resolveAttachments: () => this.ctx.get('attachments'),
+      })
+      this.attemptAdapterCache.set(entry.id, adapter)
+    }
+    return adapter
   }
 
   /** Resolve one key's credential reference through the credentials seam. */

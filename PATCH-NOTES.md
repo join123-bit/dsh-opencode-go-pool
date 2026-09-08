@@ -40,6 +40,29 @@ DSH 0.1.2-rc.1 的 `@deepseek-ai/dsh-settings` 移除了 `settingsNamespace` 导
 行为变化：0.1.11 在探测不通过时静默休眠而不是报错，因此旧日志里的"启动报错"类现象
 在 0.1.11 上会变成卡片上的 `integration probe failed: …` 提示。
 
+## v0.1.12 —— OpenCode Go 请求头透传 + 流适配器复用（2026-09-08）
+
+修复“opencode-go-pool 的 DeepSeek Flash Max 比官方 opencode-go 路由慢”的主要已知原因：
+
+1. **透传 `headers`**（`index.js`）：插件接管 `opencode-go` 路由时，原来只使用 pi-ai 的
+   静态 catalog，没有把官方路由配置里的额外请求头（尤其是 `x-opencode-session`）带到
+   实际流式请求。OpenCode Go 需要该头时，丢头会导致会话/缓存加速失效，表现为 TTFB 和
+   整体速度明显慢于官方单 Key 路由。现在 `Config` 增加 `headers` 字段，`buildProfile()`
+   会把它写入 pi-ai profile，随每次请求发往上游。
+2. **复用 per-key PiAiAdapter**（`index.js`）：每个 Key 的 PiAiAdapter 不再每次 `stream()`
+   都重建，减少 pi-ai 模型集合的重复构造开销，降低请求前置损耗。
+
+配置示例：
+
+```yaml
+- id: opencode-go-pool
+  config:
+    route: opencode-go
+    keys: []
+    headers:
+      x-opencode-session: dsh-opencode-go-session
+```
+
 ## 安装（DSH）
 
 ```sh
@@ -60,6 +83,8 @@ dsh plugin --profile web add git+https://github.com/join123-bit/dsh-opencode-go-
         preemptAtPercent: 100
         modelMode: all
         models: []
+        headers:              # 官方路由有 headers 时必须带过来，否则可能变慢
+          x-opencode-session: dsh-opencode-go-session
         usageBaseUrl: https://opencode.ai/zen/go/v1/usage
         usageRefreshMs: 30000
         timeoutMs: 15000

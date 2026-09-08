@@ -43,6 +43,8 @@ dsh plugin --profile web add github:join123-bit/dsh-opencode-go-pool#<commit-sha
     preemptAtPercent: 100       # <100 时，5h 用量达到即主动避让（默认 100：失败才切）
     modelMode: all              # all=暴露全部官方模型；custom=仅暴露 models 列出的模型
     models: []                  # modelMode=custom 时的模型 id 列表（也可在卡片内勾选）
+    headers:                    # 透传给上游的额外请求头；官方 opencode-go 路由如有请原样搬过来
+      x-opencode-session: dsh-opencode-go-session
     usageBaseUrl: https://opencode.ai/zen/go/v1/usage
     usageRefreshMs: 30000
     timeoutMs: 15000
@@ -104,6 +106,7 @@ Authorization: Bearer <OpenCode Go API Key>
 | `preemptAtPercent` | `100` | 5h 滚动用量达到该百分比即主动避让；100 = 仅在失败时切换 |
 | `modelMode` | `all` | `all`=暴露官方目录全部模型（新模型自动可用）；`custom`=仅暴露 `models` 勾选的模型 |
 | `models` | `[]` | `modelMode=custom` 时的模型 id 列表；卡片内「模型选择」勾选后写入 |
+| `headers` | `{}` | 透传给 OpenCode Go 上游的额外请求头；官方路由配置了 `x-opencode-session` 时务必原样搬入，否则可能丢失会话/缓存加速 |
 | `usageBaseUrl` | `https://opencode.ai/zen/go/v1/usage` | 用量接口地址 |
 | `modelsBaseUrl` | `https://opencode.ai/zen/go/v1/models` | 「拉取模型」接口地址 |
 | `usageRefreshMs` | `30000` | 卡片轮询间隔（host 侧另有 15s TTL 缓存） |

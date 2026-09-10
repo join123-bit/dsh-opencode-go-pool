@@ -27,6 +27,7 @@
     "typert.host.js",
     "client.js",
     "README.md",
+    "PATCH-NOTES.md",
     "LICENSE",
     "smoke.mjs",
     "cordis.patch.yml"

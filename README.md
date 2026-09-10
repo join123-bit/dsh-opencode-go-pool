@@ -152,6 +152,10 @@ DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-s
 - 启动时先探测所有依赖的 DSH 接口：模块导入、`opencodeGoProvider()` / `PiAiAdapter` 构造契约、`llm` / `settings` / `credentials` 服务方法；
 - 探测失败 → 插件**休眠**：不接管路由、不抛错、官方单 Key 路由照常服务；原因写入日志，并显示在设置卡片的 `takeoverHint` 上；
 - 这样 DSH 升级对插件的影响从"启动即崩 / 拖垮 host"降级为"可见的休眠状态"。
+- **v0.1.15 起**探针之外再加一层 `smoke.mjs` 的 profile 契约校验：`buildProfile()` 手写的 profile
+  字段（如 `modelErrors`）是被 `PiAiAdapter` 在**调用期**解引用的，启动探针看不见——漏字段时插件
+  照常启动、供应商照常列出，只有模型选择器报“加载失败”。该守卫用真实适配器驱动一次
+  `resolveModel()`，把这类漂移前移到冒烟阶段。
 
 ### 升级 DSH 后的三步检查
 
@@ -170,6 +174,7 @@ DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-s
 | DSH 版本 | 插件版本 | 模块探针 | 路由接管 | 设置卡片 | 备注 |
 |---|---|---|---|---|---|
 | 0.1.2-rc.1 | 0.1.10 / 0.1.11 | ✅（0.1.11 起） | ✅ Windows 实测 | ✅ Windows 实测 | `settingsNamespace` 补丁基线；macOS 待复测 |
+| 0.1.5-rc.1 | 0.1.15 | ✅ | ✅ macOS 实测 | ✅ macOS 实测 | 模型选择器 `resolveModel()` 曾因 profile 缺 `modelErrors` 报“加载失败”；0.1.15 修复并加回归守卫 |
 | 0.1.3-alpha.* | 未适配 | ⚠️ 升级前先跑 `smoke.mjs` | — | — | 探针会把它打成休眠而非崩溃 |
 
 每次 DSH 升级后更新此表：新版本号 → 跑 smoke → 适配 → 记录结果。

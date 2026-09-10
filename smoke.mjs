@@ -22,6 +22,8 @@
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
+import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
+import { opencodeGoProvider } from '@earendil-works/pi-ai/providers/opencode-go'
 import { probeCoreImports, Config } from './index.js'
 
 const require = createRequire(import.meta.url)
@@ -108,6 +110,47 @@ try {
   }
 } catch (error) {
   check('Config schema validates', false, String((error && error.message) || error))
+}
+
+// 4. Runtime profile contract: buildProfile() hand-declares the profile object
+//    llm-pi-ai's PiAiAdapter reads. Fields that class dereferences without a
+//    fallback are integration points exactly like an import is — and they are
+//    invisible to the checks above. llm-pi-ai 0.1.5-rc.1 reads
+//    `profile.modelErrors.get(model)` in modelOf(), so a profile that omits the
+//    map makes every resolveModel() throw "Cannot read properties of undefined
+//    (reading 'get')": listModels() keeps working, so the provider still lists
+//    while the model picker reports it as failed to load. Build a profile with
+//    the shipped shape and drive both reads through a real adapter.
+const SHIPPED_PROFILE_FIELDS = {
+  provider: 'opencode-go',
+  displayName: 'OpenCode Zen Go（池）',
+  streamIdleTimeoutMs: 300000,
+  headers: {},
+  configuredMaxTokens: new Map(),
+  modelErrors: new Map(),
+  modelCapabilities: new Map(),
+}
+
+try {
+  // The route's own first catalog model is the picker's representative resolve.
+  const catalog = opencodeGoProvider().getModels()
+  const sampleModel = catalog[0] && catalog[0].id
+  if (sampleModel === undefined) {
+    check('profile contract: resolveModel()', false, 'shipped catalog is empty')
+  } else {
+    const upstream = opencodeGoProvider()
+    if (upstream.id !== 'opencode-go') upstream.id = 'opencode-go'
+    const profile = { ...SHIPPED_PROFILE_FIELDS, piProvider: { ...upstream, getModels: () => upstream.getModels() } }
+    const adapter = new PiAiAdapter({
+      profiles: () => new Map([['opencode-go', profile]]),
+      resolveApiKey: async () => { throw new Error('smoke: keys are never resolved here') },
+      resolveAttachments: () => undefined,
+    })
+    await adapter.resolveModel('opencode-go', sampleModel)
+    check('profile contract: resolveModel()', true, sampleModel)
+  }
+} catch (error) {
+  check('profile contract: resolveModel()', false, `${String((error && error.message) || error)} — buildProfile() is missing a field this llm-pi-ai dereferences`)
 }
 
 for (const { label, ok, detail } of checks) {

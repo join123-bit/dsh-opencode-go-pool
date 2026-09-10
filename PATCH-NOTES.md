@@ -77,6 +77,49 @@ DSH 0.1.2-rc.1 的 `@deepseek-ai/dsh-settings` 移除了 `settingsNamespace` 导
   （用户层晚于 bundle 层且按行覆盖，保留手工行会覆盖 bundle 默认 config）。
 - 版本锁定仍推荐：`dsh plugin --profile web add github:join123-bit/dsh-opencode-go-pool#<sha>`。
 
+## v0.1.15 —— profile 契约补丁：模型选择器不再“加载失败”（2026-09-10）
+
+**现象**：模型下拉里 `OpenCode Zen Go（池）` 显示
+`加载失败：Cannot read properties of undefined (reading 'get')`。
+供应商能列出，但选中/解析模型即崩。
+
+**根因**：`llm-pi-ai@0.1.5-rc.1` 的 `PiAiAdapter.modelOf()` 会**无条件**读取
+profile 上的 `modelErrors`：
+
+```js
+const failure = profile.modelErrors.get(model) ?? (profile.piProvider === void 0 ? profile.catalogError : void 0)
+```
+
+而 `buildProfile()` 手写 profile 时漏了这个字段。该调用路径与 `listModels()` 分离：
+`listModels()` 从不读 `modelErrors`，所以供应商照常出现在列表里；只有模型选择器走的
+`resolveModel()` 必崩——这正是“能列出、却加载失败”的原因。
+
+`probeCoreImports()` / `selfCheck(ctx)` 也抓不到它：它们只验证模块导入、构造契约和服务
+方法，**不**验证 profile 对象在调用期被解引用的字段。
+
+**修复**（`index.js`，一行）：
+
+```diff
+     configuredMaxTokens: new Map(),
++    // llm-pi-ai 0.1.5-rc.1 PiAiAdapter.modelOf() reads `profile.modelErrors`
++    // unconditionally … the value llm-pi-ai itself declares for an error-free
++    // catalog route is exactly an empty Map.
++    modelErrors: new Map(),
+     modelCapabilities: new Map(),
+```
+
+空 Map 就是 `llm-pi-ai` 对“无模型错误”的目录路由自己声明的值（`catalog?.modelErrors ?? new Map()`），
+因此没有引入任何新行为。已实测：`resolveModel()` 恢复，未勾选模型的 `UNKNOWN_MODEL` 拦截、
+`listModels()` 选择过滤、`providerInfo()` 显示名、卡片 `status()` 全部不变。
+
+**新增回归守卫**（`smoke.mjs` 第 4 项）：用真实 `PiAiAdapter` + 本插件出声明的 profile 形状
+驱动一次 `resolveModel()`。此类“导入都在、调用期才炸”的契约漂移，从此会被冒烟脚本拦下，
+而不是等到用户打开模型下拉才发现。
+
+> 尚未补齐（已知、非阻塞）：profile 还缺 `maxRequestImageBytes` / `requestImagePixelBudget` /
+> `requestImageMaxBytes`，官方默认分别为 20MB / 4M px / 1MB；当前为 `undefined` = 不限制，
+> 与 v0.1.14 行为一致，故未在本版改动。
+
 ## 安装（DSH）
 
 > **v0.1.13 起自动挂载**：`dsh plugin add` 后插件自动进入 profile bundles，无需

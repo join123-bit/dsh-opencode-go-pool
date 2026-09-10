@@ -199,6 +199,15 @@ function buildProfile(route, dynamicDescriptors, headers = {}) {
     headers: { ...headers },
     piProvider: provider,
     configuredMaxTokens: new Map(),
+    // llm-pi-ai 0.1.5-rc.1 PiAiAdapter.modelOf() reads `profile.modelErrors`
+    // unconditionally (`profile.modelErrors.get(model)`) before consulting
+    // `catalogError`. The value llm-pi-ai itself declares for an error-free
+    // catalog route is exactly an empty Map, so an unset field made every
+    // resolveModel() — the model picker's path — throw
+    // "Cannot read properties of undefined (reading 'get')". listModels()
+    // never reads it, which is why provider listing kept working while the
+    // picker reported the provider as failed to load.
+    modelErrors: new Map(),
     // Newer llm-pi-ai builds read modelCapabilities in listModels; a catalog
     // route with no configured overrides declares none, so an empty map is
     // the exact contract (capabilityInfo() returns no claims).

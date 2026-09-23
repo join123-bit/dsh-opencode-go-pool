@@ -24,7 +24,8 @@ import { dirname, join } from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { opencodeGoProvider } from '@earendil-works/pi-ai/providers/opencode-go'
-import { probeCoreImports, Config } from './index.js'
+import { probeCoreImports, Config, buildProfile } from './index.js'
+import { dynamicModelDescriptor } from './models.js'
 
 const require = createRequire(import.meta.url)
 const failures = []
@@ -151,6 +152,51 @@ try {
   }
 } catch (error) {
   check('profile contract: resolveModel()', false, `${String((error && error.message) || error)} — buildProfile() is missing a field this llm-pi-ai dereferences`)
+}
+
+// 5. Image-input contract (v0.1.16). The descriptor's `input` is the single
+//    lever for vision: listModels() reports it as inputModalities (attachment
+//    admission in the session controller) and the adapter re-checks it before
+//    inlining an image. Drive the real buildProfile() with a vision id and with
+//    a text-only catalog model, and require the modality to land on exactly one
+//    of them.
+try {
+  const route = 'opencode-go'
+  const VISION_ID = 'deepseek-v4.1-flash'
+  const TEXT_ID = 'deepseek-v4-flash'
+  const profile = buildProfile(
+    route,
+    r => [dynamicModelDescriptor(VISION_ID, 'DeepSeek V4.1 Flash', r)],
+    {},
+    [VISION_ID],
+  )
+  const adapter = new PiAiAdapter({
+    profiles: () => new Map([[route, profile]]),
+    resolveApiKey: async () => { throw new Error('smoke: keys are never resolved here') },
+    resolveAttachments: () => undefined,
+  })
+  const models = await adapter.listModels(route)
+  const vision = models.find(model => model.id === VISION_ID)
+  const text = models.find(model => model.id === TEXT_ID)
+  check('vision: dynamic model reports image input', Boolean(vision && vision.inputModalities.includes('image')),
+    vision ? `${VISION_ID} → ${vision.inputModalities.join('+')}` : `${VISION_ID} missing from the catalog`)
+  const resolved = await adapter.resolveModel(route, VISION_ID)
+  check('vision: resolveModel() carries the image modality', resolved.inputModalities.includes('image'),
+    resolved.inputModalities.join('+'))
+  check('vision: text-only catalog model stays text-only', Boolean(text && !text.inputModalities.includes('image')),
+    text ? `${TEXT_ID} → ${text.inputModalities.join('+')}` : `${TEXT_ID} missing from the catalog`)
+  // Declaring the modality is only half the contract: the adapter hands the
+  // profile's image-request policy straight to the attachment store, whose
+  // first act is to validate maxPixels/maxBytes as positive safe integers.
+  // v0.1.16 shipped the modality without this policy, and every image request
+  // died with "Image request maxPixels must be a positive integer." — invisible
+  // to the modality checks above, because it fires only on the image path.
+  const policy = [profile.maxRequestImageBytes, profile.requestImagePixelBudget, profile.requestImageMaxBytes]
+  check('vision: profile carries a positive image request policy',
+    policy.every(value => Number.isSafeInteger(value) && value > 0),
+    policy.join(' / '))
+} catch (error) {
+  check('vision: image-input contract', false, String((error && error.message) || error))
 }
 
 for (const { label, ok, detail } of checks) {

@@ -40,10 +40,13 @@ import { opencodeGoProvider } from '@earendil-works/pi-ai/providers/opencode-go'
 import { AUTH_CODE, KeyPool, assertKeyList } from './pool.js'
 import { fetchUsage, UsageCache } from './usage.js'
 import {
+  DEFAULT_VISION_MODELS,
   dynamicModelDescriptor,
   fetchModels,
   loadDynamicModels,
+  normalizeVisionModels,
   saveDynamicModels,
+  withVisionInput,
 } from './models.js'
 
 export const name = 'opencode-go-pool'
@@ -139,6 +142,27 @@ const USAGE_CACHE_TTL_MS = 15000
 const REVIVE_THRESHOLD_PERCENT = 98
 const DEFAULT_STREAM_IDLE_TIMEOUT_MS = 300000
 
+/**
+ * Image-request policy, mirroring the defaults llm-pi-ai applies to a
+ * declarative provider route (DEFAULT_MAX_REQUEST_IMAGE_BYTES /
+ * DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET / DEFAULT_REQUEST_IMAGE_MAX_BYTES).
+ *
+ * The profile this plugin hands to PiAiAdapter is hand-built, so nothing fills
+ * these in: the adapter reads them straight off the profile and passes
+ * `{ maxPixels: profile.requestImagePixelBudget, maxBytes: profile.requestImageMaxBytes }`
+ * to `attachments.readImageRequest()`, whose first act is to validate both as
+ * positive safe integers. With them undefined, every image request on this
+ * route dies with:
+ *
+ *   Image request maxPixels must be a positive integer.  [INVALID_ATTACHMENT_REF]
+ *
+ * That path only becomes reachable once a model on the route declares image
+ * input, which is why v0.1.15 could ship without it and v0.1.16 could not.
+ */
+const DEFAULT_MAX_REQUEST_IMAGE_BYTES = 20 * 1024 * 1024
+const DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET = 2048 * 2048
+const DEFAULT_REQUEST_IMAGE_MAX_BYTES = 1024 * 1024
+
 /** The default bounded transient-retry code set, plus quota for pool rotation. */
 const BASE_RETRYABLE_CODES = ['EMPTY_RESPONSE', 'RATE_LIMIT', 'SERVER', 'TIMEOUT', 'TRANSPORT']
 
@@ -159,6 +183,13 @@ export const Config = z.object({
   // (new models appear automatically); 'custom' exposes exactly `models`.
   modelMode: z.union(['all', 'custom']).default('all'),
   models: z.array(z.string()).default([]),
+  // Model ids this route declares image-capable: their pi-ai descriptor's
+  // `input` gains 'image', which is what admits an attachment and what makes
+  // the adapter inline it. The shipped catalog already carries modalities for
+  // its own models; this exists for catalog-unknown ("dynamic") models, whose
+  // synthesized descriptor is text-only. See DEFAULT_VISION_MODELS for the
+  // verified ids and for why this list must not be filled optimistically.
+  visionModels: z.array(z.string()).default([...DEFAULT_VISION_MODELS]),
   headers: z.dict(z.string()).default({}),
   usageBaseUrl: z.string().default(DEFAULT_USAGE_BASE_URL),
   modelsBaseUrl: z.string().default(DEFAULT_MODELS_BASE_URL),
@@ -180,7 +211,7 @@ function validateSection(value) {
  * appending freshly pulled descriptors makes new supplier models usable
  * without a pi-ai package release. Known (shipped) models are never touched.
  */
-function buildProfile(route, dynamicDescriptors, headers = {}) {
+export function buildProfile(route, dynamicDescriptors, headers = {}, visionModels = DEFAULT_VISION_MODELS) {
   const upstream = opencodeGoProvider()
   if (upstream.id !== route) upstream.id = route
   const provider = {
@@ -188,13 +219,27 @@ function buildProfile(route, dynamicDescriptors, headers = {}) {
     getModels: () => {
       const base = upstream.getModels()
       const extras = dynamicDescriptors(route).filter(descriptor => !base.some(m => m.id === descriptor.id))
-      return extras.length > 0 ? [...base, ...extras] : base
+      const models = extras.length > 0 ? [...base, ...extras] : base
+      // Image input is declared here and nowhere else. The descriptor's `input`
+      // is what listModels() reports as inputModalities — which is what admits
+      // an attachment in the first place (session controller) — and what the
+      // adapter re-checks before inlining the image into the request.
+      return withVisionInput(models, visionModels)
     },
   }
   return {
     provider: route,
     displayName: DISPLAY_NAME,
     streamIdleTimeoutMs: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
+    // llm-pi-ai's own resolved provider object carries these three; a
+    // hand-built profile must too, because the attachment store validates the
+    // policy before it will produce a request image:
+    // "Image request maxPixels must be a positive integer."
+    // (Reachable only once visionModels declares a model here — see the
+    // constants above.)
+    maxRequestImageBytes: DEFAULT_MAX_REQUEST_IMAGE_BYTES,
+    requestImagePixelBudget: DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET,
+    requestImageMaxBytes: DEFAULT_REQUEST_IMAGE_MAX_BYTES,
     retryPolicy: resolveRetryPolicy(undefined, 'opencode-go-pool.catalog.retryPolicy'),
     headers: { ...headers },
     piProvider: provider,
@@ -409,6 +454,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
     this.attemptAdapterCache = new Map()
 
     this.profileRoute = null
+    this.profileVisionKey = null
     this.profileMap = null
     this.innerCatalog = null
     this.poolAdapter = null
@@ -438,9 +484,13 @@ export class OpenCodeGoPool extends TypertRemoteService {
     this.pool.setConsecutiveThreshold(cfg.switchAfterConsecutiveFailures)
     this.pool.syncKeys(cfg.keys)
 
-    if (this.profileRoute !== cfg.route) {
+    const visionModels = normalizeVisionModels(cfg.visionModels ?? DEFAULT_VISION_MODELS)
+    const visionKey = JSON.stringify(visionModels)
+    const profileChanged = this.profileRoute !== cfg.route || this.profileVisionKey !== visionKey
+    if (profileChanged) {
       this.profileRoute = cfg.route
-      this.profileMap = new Map([[cfg.route, buildProfile(cfg.route, route => this.dynamicModelDescriptors(route), cfg.headers)]])
+      this.profileVisionKey = visionKey
+      this.profileMap = new Map([[cfg.route, buildProfile(cfg.route, route => this.dynamicModelDescriptors(route), cfg.headers, visionModels)]])
       this.innerCatalog = new PiAiAdapter({
         profiles: () => this.profileMap,
         resolveApiKey: async () => {
@@ -453,10 +503,12 @@ export class OpenCodeGoPool extends TypertRemoteService {
 
     const selection = this.modelSelectionKey(cfg)
     if (this.servingRoute === cfg.route) {
-      // The model selection changed without a route change: re-announce the
-      // route so model pickers refresh their catalog from the filtered
-      // listModels(). Settings docs that predate the field read as 'all'.
-      if (this.lastModelSelection !== null && this.lastModelSelection !== selection) {
+      // The model selection OR the image-capability declaration changed without
+      // a route change: re-announce the route so model pickers refresh their
+      // catalog from the rebuilt listModels() (which carries inputModalities,
+      // the value attachment admission reads). Settings docs that predate a
+      // field read as that field's default.
+      if (profileChanged || (this.lastModelSelection !== null && this.lastModelSelection !== selection)) {
         this.announceAdapterChange()
       }
       this.lastModelSelection = selection

@@ -16,6 +16,7 @@ DeepSeek Harness（DSH）插件：**OpenCode Go 套餐的多 Key 池** —— �
 | 🧭 无缝接管 | 接管 `opencode-go` 路由：删除「设置 → 模型」中的 opencode-go 行后自动完成，历史会话与模型选择器完全不变 |
 | 🗂 模型选择 | 卡片内勾选该路由暴露哪些模型：「全部模型」跟随官方目录；自定义时未勾选的模型不出现在聊天模型下拉、也无法发起请求；默认折叠，点「展开」查看 |
 | 📥 拉取最新模型 | 卡片内「拉取模型」从官方 `models` 接口抓取供应商最新模型列表；目录里还没有的新模型即时进入可选列表（按默认协议接入，勾选即可尝试） |
+| 🖼 识图（`visionModels`） | 官方目录未声明、但上游实际支持看图的模型（默认 `deepseek-v4.1-flash`、`deepseek-flash`）声明为支持图片输入：对话里可直接粘贴图片，图片随请求发给模型。见下文「识图」 |
 
 ## 安装（v0.1.13 起自动挂载，一条命令）
 
@@ -88,6 +89,7 @@ flowchart TD
 - **路由接管**：`opencode-go` 路由被 `dsh-llm-pi-ai` 持有时，插件休眠并监听 `llm/adapters-updated`，路由一释放即原子接管；老会话记录的路由 id 不变，历史对话无缝继续。
 - **凭据**：配置只存凭据引用名（`apiKeyEnv`），明文走 DSH 凭据 seam，每次请求按引用解析；解析失败大声报 `MISSING_CREDENTIAL`，绝不回落到无关的环境变量 Key。
 - **模型选择**：卡片勾选后写入 `modelMode`/`models`；适配器的 `listModels` 只返回勾选的模型（聊天模型下拉即时生效），`resolveModel`/`stream` 对未勾选模型返回明确的 `UNKNOWN_MODEL`。选择变化会重发 `llm/adapters-updated`，模型选择器无需重启即可刷新。
+- **识图**：`visionModels` 列出的模型，其描述符 `input` 追加 `image`（`withVisionInput()`）；`listModels()` 上报的 `inputModalities` 因此包含 `image`，会话控制器的附件准入与适配器的图片内联随之放行。列表变化会重建 profile 并重发 `llm/adapters-updated`。
 - **持久化**：运行态（活动 Key / 耗尽 / 失效 / 停用）原子写入 `$DSH_HOME/opencode-go-pool.state.json`，重启恢复。
 
 ## 用量接口
@@ -116,11 +118,70 @@ Authorization: Bearer <OpenCode Go API Key>
 | `preemptAtPercent` | `100` | 5h 滚动用量达到该百分比即主动避让；100 = 仅在失败时切换 |
 | `modelMode` | `all` | `all`=暴露官方目录全部模型（新模型自动可用）；`custom`=仅暴露 `models` 勾选的模型 |
 | `models` | `[]` | `modelMode=custom` 时的模型 id 列表；卡片内「模型选择」勾选后写入 |
+| `visionModels` | `[deepseek-v4.1-flash, deepseek-flash]` | 声明为「支持图片输入」的模型 id 列表：这些模型的 pi-ai 描述符 `input` 会追加 `image`。官方目录自带模态的模型不必列在这里。见下文「识图」 |
 | `headers` | `{}` | 透传给 OpenCode Go 上游的额外请求头；官方路由配置了 `x-opencode-session` 时务必原样搬入，否则可能丢失会话/缓存加速 |
 | `usageBaseUrl` | `https://opencode.ai/zen/go/v1/usage` | 用量接口地址 |
 | `modelsBaseUrl` | `https://opencode.ai/zen/go/v1/models` | 「拉取模型」接口地址 |
 | `usageRefreshMs` | `30000` | 卡片轮询间隔（host 侧另有 15s TTL 缓存） |
 | `timeoutMs` | `15000` | 用量请求超时 |
+
+## 识图（`visionModels`）
+
+DSH 判断一个模型能否看图，只看 pi-ai 描述符的 `input` 数组：它既是 `listModels()` 上报的
+`inputModalities`（会话控制器据此准入附件，不含 `image` 时直接拒绝「Model does not support
+image input」），也是适配器 `stream()` 内联图片前的最后一道检查。
+
+问题在于：**从官方 `models` 接口拉取进来的模型（"动态"模型）没有模态信息**，插件给它们
+合成的描述符一律是 `input: ['text']` —— `deepseek-v4.1-flash` 正好就是这种模型（pi-ai 自带
+目录里没有它），所以即便上游支持看图，DSH 也会先把图片拦掉。
+
+`visionModels` 就是那个开关：列在里面的模型 id，其描述符 `input` 追加 `image`。
+
+```yaml
+opencode-go-pool:
+  visionModels:
+    - deepseek-v4.1-flash
+    - deepseek-flash
+```
+
+**默认值已包含 `deepseek-v4.1-flash` 与 `deepseek-flash`，开箱可用**，不改配置也有识图。
+要再加模型，先按下面的方法实测，再加 id。
+
+声明模态只是开关的一半：图片真正发给模型前，适配器会把 profile 上的图片请求策略
+（`maxRequestImageBytes` / `requestImagePixelBudget` / `requestImageMaxBytes`）交给附件服务，
+**附件服务会校验它们是正整数**。插件已按官方默认值补齐（20MiB / 4M px / 1MiB）；这三个值
+缺失时报的是 `Image request maxPixels must be a positive integer.`（`INVALID_ATTACHMENT_REF`），
+而不是「不支持图片」。
+
+### 为什么名单必须实测后再加
+
+给一个其实看不了图的模型声明 `image` 不会立刻报错，而是**静默失败**：图片被准入、写进会话
+记录，模型却看不见它，照常编一个回答——这是最坏的失败方式。2026-09-23 对官方端点
+（`POST https://opencode.ai/zen/go/v1/chat/completions`，需带 `x-opencode-session` 头）逐个
+探测的结果：
+
+| 模型 | 结果 |
+|---|---|
+| `deepseek-v4.1-flash` | ✅ 正确读出图里的文字与图形（默认已开） |
+| `deepseek-flash` | ✅ 同上（默认已开） |
+| `deepseek-v4-pro` | ⚠️ 接受 `image_url`，随后回答「I can't view the image」——静默忽略 |
+| `deepseek-v4-flash`、`glm-5.3` | ❌ HTTP 400 `Model only supports text input` |
+| `mimo-v2.5-pro` | ❌ 404，模型未在该路径提供服务 |
+
+验证一个候选模型（把 `<id>` 换掉即可）：
+
+```sh
+curl -s https://opencode.ai/zen/go/v1/chat/completions \
+  -H "Authorization: Bearer $OPENCODE_GO_KEY_KEY_MTS3LB30" \
+  -H 'Content-Type: application/json' \
+  -H 'x-opencode-session: dsh-opencode-go-session' \
+  -d '{"model":"<id>","max_tokens":64,"messages":[{"role":"user","content":[
+        {"type":"text","text":"Read the exact text in this image."},
+        {"type":"image_url","image_url":{"url":"data:image/png;base64,<BASE64>"}}]}]}'
+```
+
+能准确读出图片里**特定**的文字/颜色 = 真识图；报 400 = 不支持；答「看不到图片」= 静默忽略。
+只有第一类才写进 `visionModels`。
 
 ## 与其他插件的关系
 
@@ -133,7 +194,7 @@ Authorization: Bearer <OpenCode Go API Key>
 
 - Host 半：`index.js`（插件 + 池适配器 + 接管）、`pool.js`（状态机）、`usage.js`（用量网关）、`models.js`（模型目录拉取）、`typert.host.js`（RPC 清单）
 - 浏览器半：`client.js`（lazy-CJS bundle，`window.__ModuleLoader__.load` 格式）
-- 测试：`node --test test/*.test.mjs`（38 项：状态机 13、用量网关 7、cordis 烟测 8（接管协议与静默切换端到端）、真实服务集成 5（LlmRuntime 注册表/llm.stream 全链路/settings 写入/接管握手）、客户端 bundle 执行与渲染 5；缺少 harness 依赖时相关测试优雅跳过）
+- 测试：`node --test test/*.test.mjs`（本仓库随 v0.1.16 附 `test/vision.test.mjs`：识图声明的 6 项单元测试，纯 Node、无需 harness 依赖；上游其余测试文件未随本 fork 提供，缺少 harness 依赖时相关测试优雅跳过）
 
 ```sh
 node --test test/*.test.mjs

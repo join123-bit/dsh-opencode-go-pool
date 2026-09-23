@@ -16,6 +16,9 @@
         preemptAtPercent: 100
         modelMode: all
         models: []
+        visionModels:               # 识图：目录未声明、上游实际支持看图的模型（v0.1.16+）
+          - deepseek-v4.1-flash
+          - deepseek-flash
         usageBaseUrl: https://opencode.ai/zen/go/v1/usage
         usageRefreshMs: 30000
         timeoutMs: 15000

@@ -38,6 +38,86 @@ const DEFAULT_BASE_URL = 'https://opencode.ai/zen/go/v1'
 const DEFAULT_CONTEXT_WINDOW = 1000000
 const DEFAULT_MAX_TOKENS = 131072
 
+/**
+ * Models the OpenCode Go gateway serves as genuinely multimodal even though
+ * nothing in the catalog says so.
+ *
+ * The shipped pi-ai catalog is a snapshot, and the official models endpoint
+ * returns ids only — neither carries modalities for a model that arrived after
+ * the snapshot. `dynamicModelDescriptor()` therefore declares `input: ['text']`
+ * for every fetched model, and DSH trusts that declaration twice:
+ *
+ *   - `dsh-api-session-controller` refuses to attach an image at all
+ *     ("Model ... does not support image input", MODEL_DOES_NOT_SUPPORT_IMAGES)
+ *     because `resolveModel().inputModalities` omits `image`;
+ *   - `dsh-llm-pi-ai`'s stream() throws UNSUPPORTED_CONTENT when an image
+ *     reaches a descriptor whose `input` lacks `image`, and `dsh-llm` silently
+ *     projects such images into a placeholder text instead.
+ *
+ * `deepseek-v4.1-flash` and `deepseek-flash` are both catalog-unknown (dynamic)
+ * models that DO accept `image_url` content parts upstream and genuinely read
+ * them: probed 2026-09-23 against https://opencode.ai/zen/go/v1/chat/completions
+ * with a rendered image ("K7Q-3391" plus a blue square and a red circle), both
+ * returned the exact text and both shapes. The same probe shows why this list
+ * must stay evidence-based rather than optimistic:
+ *
+ *   - `deepseek-v4-flash`, `glm-5.3`  → HTTP 400, "Model only supports text input"
+ *   - `deepseek-v4-pro`              → accepts the image, then answers
+ *                                      "I can't view the image" (silent ignore)
+ *   - `mimo-v2.5-pro`                → 404, model is not served at all
+ *
+ * Declaring a text-only model here does not fail fast: the image is admitted,
+ * stored in the session, and the model answers as if no image existed — the
+ * worst possible failure mode. Add an id only after verifying it upstream.
+ */
+export const DEFAULT_VISION_MODELS = Object.freeze(['deepseek-v4.1-flash', 'deepseek-flash'])
+
+/**
+ * Normalize a configured vision-model list: strings only, trimmed, non-empty,
+ * de-duplicated, order preserved. Anything else is dropped rather than
+ * throwing — a bad settings document must not take the route down.
+ * @param {unknown} ids
+ * @returns {string[]}
+ */
+export function normalizeVisionModels(ids) {
+  if (!Array.isArray(ids)) return []
+  const out = []
+  for (const id of ids) {
+    if (typeof id !== 'string') continue
+    const trimmed = id.trim()
+    if (trimmed.length === 0 || out.includes(trimmed)) continue
+    out.push(trimmed)
+  }
+  return out
+}
+
+/**
+ * Declare `image` input on exactly the models named by `visionModels`, leaving
+ * every other descriptor — and every other field of the matching ones —
+ * untouched. Returns the input array unchanged when nothing matched, so an
+ * unconfigured route keeps object identity and no needless rebuild.
+ *
+ * This is the single lever that turns image input on for a model: the
+ * descriptor's `input` is what `listModels()` reports as `inputModalities`
+ * (attachment admission) and what `stream()` checks before inlining images.
+ * @param {Array<object>} models - pi-ai model descriptors.
+ * @param {Iterable<string>|string[]} visionModels - ids to declare image-capable.
+ * @returns {Array<object>} the same array, or a copy with `input` widened.
+ */
+export function withVisionInput(models, visionModels) {
+  const ids = visionModels instanceof Set ? visionModels : new Set(normalizeVisionModels(visionModels))
+  if (ids.size === 0) return models
+  let changed = false
+  const out = models.map(model => {
+    if (!model || typeof model.id !== 'string' || !ids.has(model.id)) return model
+    const input = Array.isArray(model.input) ? model.input : ['text']
+    if (input.includes('image')) return model
+    changed = true
+    return { ...model, input: [...input, 'image'] }
+  })
+  return changed ? out : models
+}
+
 /** Best-effort display name from a kebab-case id: "deepseek-v4-pro" → "Deepseek V4 Pro". */
 export function titleCaseId(id) {
   if (typeof id !== 'string' || id.length === 0) return id

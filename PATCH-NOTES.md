@@ -116,9 +116,98 @@ const failure = profile.modelErrors.get(model) ?? (profile.piProvider === void 0
 驱动一次 `resolveModel()`。此类“导入都在、调用期才炸”的契约漂移，从此会被冒烟脚本拦下，
 而不是等到用户打开模型下拉才发现。
 
-> 尚未补齐（已知、非阻塞）：profile 还缺 `maxRequestImageBytes` / `requestImagePixelBudget` /
+> ~~尚未补齐（已知、非阻塞）：profile 还缺 `maxRequestImageBytes` / `requestImagePixelBudget` /
 > `requestImageMaxBytes`，官方默认分别为 20MB / 4M px / 1MB；当前为 `undefined` = 不限制，
-> 与 v0.1.14 行为一致，故未在本版改动。
+> 与 v0.1.14 行为一致，故未在本版改动。~~
+>
+> **已由 v0.1.16 补齐。** 当时的判断「`undefined` = 不限制」是错的：这三个值不是可选的，
+> 附件服务会**校验**它们（`Image request maxPixels must be a positive integer.`）。只是
+> v0.1.15 时路由上没有任何模型声明 `image`，这条路径不可达，所以没暴露。
+
+## v0.1.16 —— 识图：`visionModels`（2026-09-23）
+
+**现象**：`deepseek-v4.1-flash` 在对话里贴图片被拒（`Model ... does not support image input`，
+`MODEL_DOES_NOT_SUPPORT_IMAGES`），但该模型上游**确实能看图**。
+
+**根因**：DSH 只认 pi-ai 描述符的 `input` 数组 —— 它既是 `listModels()` 上报的
+`inputModalities`（`dsh-api-session-controller` 据此准入附件），也是 `dsh-llm-pi-ai`
+`stream()` 内联图片前的检查（不含 `image` 直接抛 `UNSUPPORTED_CONTENT`）。而
+`deepseek-v4.1-flash` 不在 pi-ai 自带目录里（属于从官方 `models` 接口拉取的"动态"模型），
+`dynamicModelDescriptor()` 给所有动态模型硬编码 `input: ['text']`，模态信息无处可来。
+
+**修复**（配置项，默认开箱可用）：
+
+```yaml
+opencode-go-pool:
+  visionModels:
+    - deepseek-v4.1-flash
+    - deepseek-flash
+```
+
+- `models.js`：新增 `DEFAULT_VISION_MODELS`、`normalizeVisionModels()`、`withVisionInput()`
+  —— 只给名单内的 id 追加 `image`，其余描述符（含字段与对象身份）不动；
+- `index.js`：`Config.visionModels`（默认 = `DEFAULT_VISION_MODELS`）；`buildProfile()` 在
+  `getModels()` 里套一层 `withVisionInput()`（这是唯一入口：动态模型与自带目录模型都经过它）；
+  `applyConfig()` 在名单变化时重建 profile 并重发 `llm/adapters-updated`（模型选择器即时刷新）。
+- `cordis.patch.yml`：bundle 默认值同上。
+
+**修复（二）：补齐 image request policy**。只声明模态还不够 —— 首次真机上传图片就炸：
+
+```
+Image request maxPixels must be a positive integer.   [INVALID_ATTACHMENT_REF]
+```
+
+`buildProfile()` 手写的 profile 少了 `maxRequestImageBytes` / `requestImagePixelBudget` /
+`requestImageMaxBytes`，适配器把后两者原样交给
+`attachments.readImageRequest(ref, policy)`，而附件服务**第一步就校验**它们是正整数
+（`dsh-attachment-local`：`validatePolicy()` → `checkedInteger()`）。官方目录路由这三个值由
+`llm-pi-ai` 填默认（20MB / 4M px / 1MB），手写 profile 必须自己带。v0.1.15 的「`undefined`
+= 不限制」是误判：v0.1.15 时路由上没有模型声明 `image`，这条路径不可达而已。
+
+```diff
+     streamIdleTimeoutMs: DEFAULT_STREAM_IDLE_TIMEOUT_MS,
++    maxRequestImageBytes: DEFAULT_MAX_REQUEST_IMAGE_BYTES,        // 20MiB
++    requestImagePixelBudget: DEFAULT_REQUEST_IMAGE_PIXEL_BUDGET,  // 2048*2048
++    requestImageMaxBytes: DEFAULT_REQUEST_IMAGE_MAX_BYTES,        // 1MiB
+```
+
+**为什么不是一行改所有动态模型**：给看不了图的模型声明 `image` 不会报错，而是静默失败
+（图片进会话、模型看不见、照常作答）。2026-09-23 实测：
+
+| 模型 | 结果 |
+|---|---|
+| `deepseek-v4.1-flash`、`deepseek-flash` | ✅ 正确读出图中文字与图形 |
+| `deepseek-v4-pro` | ⚠️ 接受 `image_url`，回答「I can't view the image」 |
+| `deepseek-v4-flash`、`glm-5.3` | ❌ 400 `Model only supports text input` |
+| `mimo-v2.5-pro` | ❌ 404，未在该路径提供服务 |
+
+**验证**（全真链路：真实 `buildProfile()` + 真实 `PiAiAdapter` + **真实 `dsh-attachment-local`**
+（normalize → commit → request image）+ 真实端点，同一张图）：
+
+```
+1) v0.1.16 出厂时的 policy（undefined） → INVALID_ATTACHMENT_REF: Image request maxPixels must be a positive integer.
+   （用户报的就是这条）
+2) 修复后的 policy                      → maxPixels=4194304 maxBytes=1048576 → 360x140 image/png 1607B
+
+A. visionModels: []                      → inputModalities: text
+                                           REFUSED [UNSUPPORTED_CONTENT] does not support image input
+B. visionModels: ['deepseek-v4.1-flash'] → inputModalities: text+image
+                                           "The exact text printed in the image is: ZX4-8802
+                                            The shape on the left is a green triangle,
+                                            the shape on the right is a yellow rectangle."
+```
+
+> 上一版验证脚本**伪造了**附件服务（只实现 `readImageRequest`），所以漏掉了 policy 校验 ——
+> 这正是它没拦住这个 bug 的原因。脚本已改为走真实附件管线（`vision-e2e.mjs`）。
+
+**新增回归守卫**：`smoke.mjs` 第 5 项 —— 用真实 `buildProfile()` + 真实 `PiAiAdapter`
+断言「动态模型在名单内 → `inputModalities` 含 `image`、`resolveModel()` 同样含；
+自带目录的纯文本模型（`deepseek-v4-flash`）保持 `text`；**profile 的 image request policy
+是正整数**（模态断言看不见的那一半，正是上面那条真机报错）」。另有
+`test/vision.test.mjs`（6 项，`node --test test/*.test.mjs`）。
+
+**不涉及**：客户端卡片（`client.js`）与 Typert 严格 schema（`typert.host.js`）未改动 ——
+本参数是纯 host 侧配置项，改 `settings.yaml` 或 bundle patch 即可，无卡片 UI。
 
 ## 安装（DSH）
 

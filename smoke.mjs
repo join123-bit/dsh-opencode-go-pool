@@ -199,6 +199,50 @@ try {
   check('vision: image-input contract', false, String((error && error.message) || error))
 }
 
+// 6. Typert manifest contract (v0.1.17). The typert-loader validates the
+//    hand-written ./typert manifest BEFORE the plugin body runs, so item 2's
+//    probe can never see a drift here — a stale strict-codec shape fails the
+//    whole activation with «strict codec has no create() factory», not a
+//    dormant plugin. Since dsh-typert-protocol 0.1.6 the loader requires every
+//    strict codec (every parameter and result) to expose a `create()` factory
+//    returning a schema with parse(); assert that shape on the shipped
+//    manifest and exercise the zod primitive codecs through a created codec.
+try {
+  const { TYPERT } = await import('./typert.host.js')
+  const entries = []
+  for (const invocation of TYPERT.invocations ?? []) {
+    entries.push({ at: `${invocation.id} result`, codec: invocation.result })
+    for (const parameter of invocation.parameters ?? []) {
+      entries.push({ at: `${invocation.id} param ${parameter.wire}`, codec: parameter.codec })
+    }
+  }
+  check('typert: manifest declares invocations', entries.length > 0, String(entries.length))
+  const strictShape = entries.filter(({ codec }) => codec && codec.mode === 'strict' && typeof codec.typeSymbol === 'string')
+  check('typert: every codec is strict with typeSymbol', strictShape.length === entries.length,
+    `${strictShape.length}/${entries.length}`)
+  const withFactory = entries.filter(({ codec }) => typeof codec.create === 'function')
+  check('typert: strict codecs expose create()', withFactory.length === entries.length,
+    `${withFactory.length}/${entries.length}`)
+  const unusable = []
+  for (const { at, codec } of entries) {
+    const created = codec.create()
+    if (typeof created?.parse !== 'function') {
+      unusable.push(`${at}: create() did not return a schema with parse()`)
+      continue
+    }
+    if (codec.typeSymbol === 'boolean' || codec.typeSymbol === 'string') {
+      try {
+        created.parse(codec.typeSymbol === 'boolean' ? true : 'x')
+      } catch (error) {
+        unusable.push(`${at}: ${String((error && error.message) || error)}`)
+      }
+    }
+  }
+  check('typert: created codecs are parseable schemas', unusable.length === 0, unusable.join('; '))
+} catch (error) {
+  check('typert: manifest contract', false, String((error && error.message) || error))
+}
+
 for (const { label, ok, detail } of checks) {
   if (ok) console.log(`PASS  ${label}${detail ? `  →  ${detail}` : ''}`)
   else console.log(`FAIL  ${label}${detail ? `  →  ${detail}` : ''}`)

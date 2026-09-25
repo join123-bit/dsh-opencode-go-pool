@@ -209,6 +209,61 @@ B. visionModels: ['deepseek-v4.1-flash'] → inputModalities: text+image
 **不涉及**：客户端卡片（`client.js`）与 Typert 严格 schema（`typert.host.js`）未改动 ——
 本参数是纯 host 侧配置项，改 `settings.yaml` 或 bundle patch 即可，无卡片 UI。
 
+## v0.1.17 —— Typert codec 契约迁移：桌面版（nightly）加载失败修复（2026-09-26）
+
+**现象**：DSH 桌面版（nightly 渠道，内置 `dsh-typert-protocol >= 0.1.6`）安装本插件后启动即报：
+
+```
+加载失败: typert: dsh-opencode-go-pool#opencodePool/status result strict codec has no create() factory
+```
+
+**根因**：`dsh-typert-protocol@0.1.6`（deepseek-harness commit `e459e326`
+「perf(typert): materialize generated schemas on first use」，2026-09-14 合入，
+09-15 发布 alpha）把 strict codec 从 `{ mode: 'strict', typeSymbol, schema }` 改为
+`{ mode: 'strict', typeSymbol, create: () => TypertSchema }` —— schema **首次使用时才物化**。
+typert-loader 在插件激活时逐条校验 invocation 的参数/结果 codec
+（`requireStrictCodec()`：`typeof codec.create !== 'function'` 即抛错），而本插件的
+manifest 仍是 0.1.0-rc.5 时代的旧形状，第一个 invocation（`status` 的 result codec）
+就撞上校验，**整个插件激活失败**。业务侧探针（`probeCoreImports()` / `selfCheck()`）
+救不了它：manifest 校验发生在插件 body 运行之前、由 loader 执行，属于硬失败而非休眠。
+
+**修复**（`typert.host.js`，一处，所有 invocation 共用）：
+
+```diff
+- const strict = (typeSymbol, schema) => ({ mode: 'strict', typeSymbol, schema })
++ const strict = (typeSymbol, schema) => ({
++   mode: 'strict',
++   typeSymbol,
++   schema,             // 兼容 0.1.2-rc 时代 loader（dsh-typert-protocol ^0.1.0-rc.5）
++   create: () => schema, // >= 0.1.6 桌面契约：工厂返回可 parse 的 TypertSchema
++ })
+```
+
+zod v4 schema 自带 `parse()`，`create()` 直接返回它就是合法的 `TypertSchema`；
+保留 `schema` 字段是为了新旧 loader 双兼容。**同时**把 peerDependencies 的
+`@deepseek-ai/dsh-typert-protocol` 从 `^0.1.0-rc.5` 升到 `^0.1.7-rc.2`
+（桌面 nightly 对应的 next 版本）。
+
+**新增回归守卫**：`smoke.mjs` 第 6 项 —— 导入本包 `./typert` manifest，断言每个
+invocation 的参数/结果 codec 都是 strict、带 `typeSymbol`、暴露 `create()` 且
+`create().parse()` 可用。此类失败发生在插件 body 之前，探针看不到，必须由
+manifest 自身的形状守卫拦下。
+
+**验证**：
+- 用桌面 app（`dsh-nightly`，`D:\software\dsh\resources\app.asar`）内**真实
+  typert-loader**（`@deepseek-ai/dsh-typert-loader`）的 `validateTypertManifest()`
+  校验本包 `./typert`：9 个 invocation **全部 PASS**；负向对照（旧形状、无 `create()`）
+  被同一 loader 拒绝，报错正是本版修复的
+  `… result codec has no create() factory`；
+- `smoke.mjs` 第 6 项为后续回归守卫（加载类契约漂移的前置告警）；
+- 路由接管 / 设置卡片 / Key 轮换的桌面全链路：**待桌面重启后实测**（见 README
+  兼容矩阵，实测后更新）。
+
+**已知后续（非本版范围）**：其余 `@deepseek-ai/dsh-*` peer（`dsh-credentials` /
+`dsh-settings` / `dsh-llm` / `dsh-llm-pi-ai` / `dsh-api-remotes` 等）同样在 rc 期
+快速迭代，老 peer 范围在全新安装时可能解析不到最新器件；按 README「稳定性」章节
+锁 commit 安装，升级 DSH 后先跑 `smoke.mjs` 再信任。
+
 ## 安装（DSH）
 
 > **v0.1.13 起自动挂载**：`dsh plugin add` 后插件自动进入 profile bundles，无需

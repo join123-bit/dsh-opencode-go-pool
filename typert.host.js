@@ -8,6 +8,14 @@
 // whole plugin activation). Every result below is therefore a zod v4 schema;
 // the business payload (status) is strict-validated before it crosses the
 // wire, and the simple mutation results ride as strict booleans/strings.
+//
+// Since dsh-typert-protocol 0.1.6 (deepseek-harness «perf(typert): materialize
+// generated schemas on first use») a strict codec must expose a `create()`
+// factory that materializes the boundary schema on first use instead of
+// carrying a pre-built `schema`; the loader rejects a strict codec without
+// `create` at activation («strict codec has no create() factory»). The
+// `strict()` helper below emits BOTH shapes: `schema` for pre-0.1.6 loaders
+// (DSH 0.1.2-rc era) and `create()` for 0.1.6+ (desktop nightly builds).
 
 import { z } from 'zod'
 
@@ -84,7 +92,17 @@ const keyInputSchema = z.object({
   apiKeyEnv: z.string(),
 })
 
-const strict = (typeSymbol, schema) => ({ mode: 'strict', typeSymbol, schema })
+const strict = (typeSymbol, schema) => ({
+  mode: 'strict',
+  typeSymbol,
+  // pre-0.1.6 shape — read by DSH 0.1.2-rc era loaders (dsh-typert-protocol ^0.1.0-rc.5).
+  schema,
+  // dsh-typert-protocol >= 0.1.6 contract — the desktop loader requires this
+  // factory (materialize the schema on first boundary use). A zod v4 schema is
+  // already a live object whose parse() satisfies TypertSchema, so returning it
+  // directly is the whole factory.
+  create: () => schema,
+})
 
 const invocation = (method, parameters, result) => ({
   id: `dsh-opencode-go-pool#opencodePool/${method}`,

@@ -1,6 +1,6 @@
 {
   "name": "dsh-opencode-go-pool",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "description": "DeepSeek Harness plugin: multi-key pool with automatic quota failover and a usage dashboard for the OpenCode Go plan",
   "license": "MIT",
   "keywords": [
@@ -60,7 +60,7 @@
     "react": "^18.0.0",
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/schemastery": "^3.18.1",
-    "@deepseek-ai/dsh-typert-protocol": "^0.1.0-rc.5",
+    "@deepseek-ai/dsh-typert-protocol": "^0.1.7-rc.2",
     "@deepseek-ai/dsh-credentials": "^0.1.0-rc.5",
     "@deepseek-ai/dsh-settings": "^0.1.0-rc.5",
     "@deepseek-ai/dsh-llm": "^0.1.0-rc.5",

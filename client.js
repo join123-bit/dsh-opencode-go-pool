@@ -226,14 +226,19 @@ window.__ModuleLoader__.load({
     const passthrough = () => ({ parse(value) { return value; } });
     // NOTE: every result codec must be strict — the generated client Remote
     // binder rejects src-json results at mount time ("has no strict codec").
-    const strict = () => ({ mode: 'strict', typeSymbol: 'json', schema: passthrough() });
+    // Since dsh-typert-protocol 0.1.6 the client registry's validateCodec()
+    // ALSO requires strict codecs to expose a create() factory (「typert: …
+    // strict codec has no create() factory」) — same contract as the host
+    // loader, enforced on the client side at ctx.remote.$mount() time. A
+    // codec without create() fails the whole settings card with 加载失败.
+    const strict = () => ({ mode: 'strict', typeSymbol: 'json', schema: passthrough(), create: passthrough });
     const DESCRIPTOR = (method, parameters) => ({
       id: `dsh-opencode-go-pool#opencodePool/${method}`,
       service: 'opencodePool',
       namespace: 'opencodePool',
       method,
       invocation: { kind: 'direct' },
-      parameters: parameters.map(p => ({ name: p, wire: p, source: 'json', codec: { mode: 'strict', typeSymbol: 'json', schema: passthrough() } })),
+      parameters: parameters.map(p => ({ name: p, wire: p, source: 'json', codec: strict() })),
       result: strict(),
     });
 

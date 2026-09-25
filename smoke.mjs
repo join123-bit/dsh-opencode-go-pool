@@ -243,6 +243,26 @@ try {
   check('typert: manifest contract', false, String((error && error.message) || error))
 }
 
+// 7. Client remote codec contract (v0.1.18). The settings card mounts its
+//    remote with hand-written descriptors in client.js, and the CLIENT
+//    registry (dsh-typert-registry/lib/client.js validateCodec) enforces the
+//    same create() rule on strict codecs at ctx.remote.$mount() time —
+//    «typert: <endpoint> result strict codec has no create() factory» fails
+//    the card with 加载失败 even when the host loader accepts the manifest.
+//    client.js is browser code (React) and cannot be imported here, so guard
+//    its source shape: the strict() helper and every descriptor codec must go
+//    through it, and it must carry create().
+try {
+  const source = readFileSync(new URL('./client.js', import.meta.url), 'utf8')
+  const hasFactory = source.includes('create: passthrough')
+  const usesHelper = source.includes('codec: strict()')
+  const noInlineOldShape = !/codec: \{ mode: 'strict'[^}]*schema: passthrough\(\) \}/.test(source)
+  check('client: strict codecs declare create()', hasFactory && usesHelper && noInlineOldShape,
+    `factory=${hasFactory} helper=${usesHelper} inlineOld=${!noInlineOldShape}`)
+} catch (error) {
+  check('client: strict codecs declare create()', false, String((error && error.message) || error))
+}
+
 for (const { label, ok, detail } of checks) {
   if (ok) console.log(`PASS  ${label}${detail ? `  →  ${detail}` : ''}`)
   else console.log(`FAIL  ${label}${detail ? `  →  ${detail}` : ''}`)

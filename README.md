@@ -217,10 +217,14 @@ DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-s
   字段（如 `modelErrors`）是被 `PiAiAdapter` 在**调用期**解引用的，启动探针看不见——漏字段时插件
   照常启动、供应商照常列出，只有模型选择器报“加载失败”。该守卫用真实适配器驱动一次
   `resolveModel()`，把这类漂移前移到冒烟阶段。
-- **v0.1.17 起**：Typert manifest 是**另一类前置契约** —— typert-loader 在插件 body 运行**之前**
-  校验 `./typert` 的每个 strict codec 必须带 `create()` 工厂（`dsh-typert-protocol >= 0.1.6`），
-  不满足会直接"加载失败"而不是休眠，探针同样看不见。因此 `smoke.mjs` 第 6 项改为直接校验
-  manifest 形状；升级 DSH 后若插件不是休眠而是加载失败，先查 `typert.host.js` 的 codec 契约。
+- **v0.1.17 起**：Typert 的 `create()` 契约（`dsh-typert-protocol >= 0.1.6`）**两条路径都要满足**：
+  - **host 侧**（`typert.host.js`）：typert-loader 在插件 body 运行**之前**校验每个 strict codec，
+    不满足直接"加载失败"而不是休眠，探针同样看不见 —— `smoke.mjs` 第 6 项守卫；
+  - **客户端侧**（`client.js`）：设置卡片经 `ctx.remote.$mount()` 挂载远程，**客户端注册表**
+    （`dsh-typert-registry` 的 `validateCodec`）同样要求 strict codec 带 `create()`，
+    不满足表现为卡片「加载失败: typert: … result strict codec has no create() factory」
+    —— v0.1.18 修复，`smoke.mjs` 第 7 项做源形状守卫。
+  升级 DSH 后若插件或卡片加载失败，先对照这两个文件的 codec 形状。
 
 ### 升级 DSH 后的三步检查
 
@@ -240,7 +244,7 @@ DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-s
 |---|---|---|---|---|---|
 | 0.1.2-rc.1 | 0.1.10 / 0.1.11 | ✅（0.1.11 起） | ✅ Windows 实测 | ✅ Windows 实测 | `settingsNamespace` 补丁基线；macOS 待复测 |
 | 0.1.5-rc.1 | 0.1.15 | ✅ | ✅ macOS 实测 | ✅ macOS 实测 | 模型选择器 `resolveModel()` 曾因 profile 缺 `modelErrors` 报“加载失败”；0.1.15 修复并加回归守卫 |
-| 桌面 nightly（`dsh-typert-protocol ≥ 0.1.6`） | 0.1.17 | ✅ 真实 loader 校验（桌面 app asar 内 `validateTypertManifest`） | 待桌面实测 | 待桌面实测 | 曾整体“加载失败”（manifest 无 `create()`）；0.1.17 迁移 codec 契约并同步 peer 范围 |
+| 桌面 nightly（`dsh-typert-protocol ≥ 0.1.6`） | 0.1.18 | ✅ host loader + 客户端注册表契约校验（asar 内真实代码逐字对照） | 待桌面实测 | 待桌面实测 | 曾报「卡片加载失败」（客户端 codec 无 `create()`）；0.1.17 修 host 侧、0.1.18 修客户端侧并同步 peer 范围 |
 | 0.1.3-alpha.* | 未适配 | ⚠️ 升级前先跑 `smoke.mjs` | — | — | 探针会把它打成休眠而非崩溃 |
 
 每次 DSH 升级后更新此表：新版本号 → 跑 smoke → 适配 → 记录结果。

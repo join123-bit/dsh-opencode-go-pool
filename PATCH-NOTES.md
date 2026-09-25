@@ -264,6 +264,56 @@ manifest 自身的形状守卫拦下。
 快速迭代，老 peer 范围在全新安装时可能解析不到最新器件；按 README「稳定性」章节
 锁 commit 安装，升级 DSH 后先跑 `smoke.mjs` 再信任。
 
+## v0.1.18 —— 补上客户端 codec 契约：设置卡片「加载失败」的真正来源（2026-09-26）
+
+**现象**：v0.1.17 安装后 host 侧已能挂载（loader 不再报错），但「设置 → OpenCode Go
+套餐池」卡片仍显示：
+
+```
+加载失败: typert: dsh-opencode-go-pool#opencodePool/status result strict codec has no create() factory
+```
+
+**根因（v0.1.17 漏了客户端这一半）**：Typert 的 `create()` 契约在**客户端注册表**同样生效。
+`client.js` 里设置卡片用手写 descriptor 挂载远程（`ctx.remote.$mount(TYPERT_REMOTE)`），
+桌面版 `dsh-typert-registry/lib/client.js` 的 `validateCodec()` 会在挂载时校验每个
+参数/结果 codec：
+
+```js
+validateCodec(descriptor.result, `${descriptor.id} result`);
+// …
+if (typeof codec.create !== "function")
+  throw new Error(`typert: ${subject} strict codec has no create() factory`);
+```
+
+而 `client.js` 的 codec 仍是旧形状 `{ mode: 'strict', typeSymbol: 'json', schema: passthrough() }`
+（无 `create()`）→ 第一个 descriptor（`status` 的 result）就抛错 → 卡片装配失败、显示
+「加载失败」。v0.1.17 只修复了 host 侧 loader/注册表路径（`typert.host.js`），
+客户端路径漏掉了；两条路径都必须满足新契约。
+
+**修复**（`client.js`，一处 helper，全部 descriptor 共用）：
+
+```diff
+  const passthrough = () => ({ parse(value) { return value; } });
+- const strict = () => ({ mode: 'strict', typeSymbol: 'json', schema: passthrough() });
++ const strict = () => ({ mode: 'strict', typeSymbol: 'json', schema: passthrough(), create: passthrough });
+  // 参数 codec 也改走 strict()，不再内联写旧形状：
+- parameters: parameters.map(p => ({ name: p, wire: p, source: 'json', codec: { mode: 'strict', typeSymbol: 'json', schema: passthrough() } })),
++ parameters: parameters.map(p => ({ name: p, wire: p, source: 'json', codec: strict() })),
+```
+
+`create: passthrough` —— `passthrough()` 返回 `{ parse(value) { return value } }`，
+正是 `TypertSchema` 形状；保留 `schema` 字段兼容旧客户端装配。
+
+**新增回归守卫**：`smoke.mjs` 第 7 项 —— `client.js` 是浏览器代码（React）无法在
+node 里 import，改为**源形状守卫**：断言 codec helper 带 `create:`、参数 codec 统一
+走 `strict()`、不存在内联的旧形状 codec。
+
+**验证**：
+- 用桌面 app.asar 内**真实客户端注册表**（`dsh-typert-registry/lib/client.js` 的
+  `validateCodec` 逻辑）逐字对照：修复后 `create` 存在、校验通过；v0.1.17 的旧形状
+  恰好触发你贴出的那句报错（`typert: <endpoint> result strict codec has no create() factory`）；
+- 桌面实测：冷启动后设置卡片正常渲染、`status()` 与 Key 操作可用（待填实测结果）。
+
 ## 安装（DSH）
 
 > **v0.1.13 起自动挂载**：`dsh plugin add` 后插件自动进入 profile bundles，无需

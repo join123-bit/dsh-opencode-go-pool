@@ -180,6 +180,14 @@ const keyEntry = z.object({
 
 export const Config = z.object({
   route: z.union([DEFAULT_ROUTE, ALT_ROUTE]).default(DEFAULT_ROUTE),
+  // What to do when `route` is already owned by another plugin (the shipped
+  // llm-pi-ai opencode-go provider row, typically):
+  //   'own-route' (default) — register this plugin's own route instead, so the
+  //     official configuration keeps working and the pool is simply a second
+  //     provider in the model picker. Nothing has to be deleted.
+  //   'wait' — register nothing until the owning plugin releases the route,
+  //     then take over automatically (the pre-0.1.20 behaviour).
+  routeConflict: z.union(['own-route', 'wait']).default('own-route'),
   keys: z.array(keyEntry).default([]),
   preemptAtPercent: z.number().min(0).max(100).default(100),
   // Consecutive non-quota failures (rate limit / server / timeout) after
@@ -490,13 +498,15 @@ export class OpenCodeGoPool extends TypertRemoteService {
     // on every stream attempt (the official route reuses one adapter).
     this.attemptAdapterCache = new Map()
 
-    this.profileRoute = null
+    this.profileRoutesKey = null
+    this.configuredRoute = null
     this.profileVisionKey = null
     this.profileMap = null
     this.innerCatalog = null
     this.poolAdapter = null
     this.registration = null
     this.servingRoute = null
+    this.coexistingFallback = false
     this.lastTakeoverError = null
     this.lastModelSelection = null
 
@@ -505,6 +515,11 @@ export class OpenCodeGoPool extends TypertRemoteService {
     this.applyConfig()
     this.offAdaptersUpdated = ctx.on('llm/adapters-updated', () => {
       if (this.servingRoute === null) this.tryRegister()
+      // Serving our own route beside the shipped provider: watch for that
+      // route being released, so a session already pointing at the official
+      // `opencode-go` models keeps working (transparent takeover) instead of
+      // losing its provider.
+      else if (this.coexistingFallback) void this.tryTakeover()
     })
     this.tryRegister()
   }
@@ -583,11 +598,20 @@ export class OpenCodeGoPool extends TypertRemoteService {
 
     const visionModels = normalizeVisionModels(cfg.visionModels ?? DEFAULT_VISION_MODELS)
     const visionKey = JSON.stringify(visionModels)
-    const profileChanged = this.profileRoute !== cfg.route || this.profileVisionKey !== visionKey
+    // Both routes are served from the same catalog: the pool takes over
+    // `opencode-go` when it is free, and serves `opencode-go-pool` while the
+    // shipped provider row still owns that route (routeConflict: 'own-route').
+    // Building a profile per route keeps whichever route wins resolvable and
+    // makes each profile's own `provider` field match its map key.
+    const routesKey = `${DEFAULT_ROUTE}|${ALT_ROUTE}|${JSON.stringify(cfg.headers ?? {})}`
+    const profileChanged = this.profileRoutesKey !== routesKey || this.profileVisionKey !== visionKey
     if (profileChanged) {
-      this.profileRoute = cfg.route
+      this.profileRoutesKey = routesKey
       this.profileVisionKey = visionKey
-      this.profileMap = new Map([[cfg.route, buildProfile(cfg.route, route => this.dynamicModelDescriptors(route), cfg.headers, visionModels)]])
+      this.profileMap = new Map([DEFAULT_ROUTE, ALT_ROUTE].map(route => [
+        route,
+        buildProfile(route, candidate => this.dynamicModelDescriptors(candidate), cfg.headers, visionModels),
+      ]))
       this.innerCatalog = new PiAiAdapter({
         profiles: () => this.profileMap,
         resolveApiKey: async () => {
@@ -599,7 +623,10 @@ export class OpenCodeGoPool extends TypertRemoteService {
     if (!this.poolAdapter) this.poolAdapter = new OpenCodeGoPoolAdapter(this)
 
     const selection = this.modelSelectionKey(cfg)
-    if (this.servingRoute === cfg.route) {
+    const candidates = this.candidateRoutes(cfg)
+    const routeChanged = this.configuredRoute !== cfg.route
+    this.configuredRoute = cfg.route
+    if (this.servingRoute !== null && candidates.includes(this.servingRoute) && !routeChanged) {
       // The model selection OR the image-capability declaration changed without
       // a route change: re-announce the route so model pickers refresh their
       // catalog from the rebuilt listModels() (which carries inputModalities,
@@ -613,6 +640,12 @@ export class OpenCodeGoPool extends TypertRemoteService {
     }
     this.lastModelSelection = selection
     this.tryRegister()
+  }
+
+  /** The routes this configuration may serve, in preference order. */
+  candidateRoutes(cfg) {
+    const alternate = cfg.route === DEFAULT_ROUTE ? ALT_ROUTE : DEFAULT_ROUTE
+    return cfg.routeConflict === 'wait' ? [cfg.route] : [cfg.route, alternate]
   }
 
   /** A stable key for the enabled-model selection (null = all models). */
@@ -642,33 +675,81 @@ export class OpenCodeGoPool extends TypertRemoteService {
   }
 
   /**
-   * Register (or atomically re-route) the pool adapter. A conflicting route
-   * leaves the previous registration serving and records the refusal; the
-   * `llm/adapters-updated` subscription retries after every topology commit,
-   * so removing the opencode-go row under Settings → Models hands the route
-   * to this plugin automatically.
+   * Register the pool adapter on the best route this composition allows.
+   *
+   * The candidate order is the configured `route` first, then — unless
+   * `routeConflict: 'wait'` pins the plugin to one route — the other route of
+   * the pair. The shipped `llm-pi-ai` opencode-go provider row usually owns
+   * `opencode-go`; registering `opencode-go-pool` beside it is what lets the
+   * official configuration and this pool coexist, with no row to delete.
+   *
+   * A route already served by this plugin is left alone: an in-flight model
+   * selection names a route id, so silently migrating from the own route to a
+   * freed official one would break the picker's current choice. The
+   * `llm/adapters-updated` subscription keeps retrying only while nothing is
+   * registered at all.
    */
   tryRegister() {
-    const route = this.current().route
-    if (this.servingRoute === route) return
-    try {
-      if (this.registration === null) {
-        this.registration = this.ownerCtx.llm.registerAdapter([route], this.poolAdapter)
-      } else {
-        this.registration.replace([route])
+    const cfg = this.current()
+    const preferred = cfg.route
+    const candidates = this.candidateRoutes(cfg)
+    const currentIndex = candidates.indexOf(this.servingRoute)
+    if (currentIndex === 0) return
+    let lastError = null
+    for (const [index, route] of candidates.entries()) {
+      if (index === currentIndex) return
+      try {
+        if (this.registration === null) {
+          this.registration = this.ownerCtx.llm.registerAdapter([route], this.poolAdapter)
+        } else {
+          this.registration.replace([route])
+        }
+        this.servingRoute = route
+        this.coexistingFallback = index > 0
+        this.lastTakeoverError = null
+        this.logger?.info?.(`[opencode-go-pool] serving provider route "${route}"${this.coexistingFallback ? ` (route "${preferred}" is owned by another plugin; both providers stay available)` : ''}`)
+        return
+      } catch (error) {
+        lastError = String((error && error.message) || error)
+        this.logger?.warn?.(
+          this.coexistingFallback || index > 0
+            ? `[opencode-go-pool] route "${route}" unavailable: ${lastError}`
+            : `[opencode-go-pool] route "${route}" unavailable: ${lastError}; ${cfg.routeConflict === 'wait' ? 'waiting for the owning plugin to release it' : 'trying this plugin\'s own route instead'}`,
+        )
       }
-      this.servingRoute = route
-      this.lastTakeoverError = null
-      this.logger?.info?.(`[opencode-go-pool] serving provider route "${route}"`)
-    } catch (error) {
-      this.lastTakeoverError = String((error && error.message) || error)
-      this.logger?.warn?.(`[opencode-go-pool] route "${route}" unavailable: ${this.lastTakeoverError}; waiting for the owning plugin to release it`)
     }
+    this.lastTakeoverError = lastError
+    if (this.servingRoute !== null) return
+    this.coexistingFallback = false
+  }
+
+  /**
+   * Migrate the coexisting fallback registration onto the configured route
+   * once the plugin that owned it lets go (its provider row was deleted).
+   *
+   * Availability is read from the provider registry instead of attempted
+   * blindly: a failed `registerAdapter` throws, and `llm/adapters-updated`
+   * fires on every topology commit, so probing by exception would spam the log
+   * for as long as the official row exists. Enumeration failures are ignored —
+   * this is an optimisation, and `tryRegister()` remains the authority.
+   */
+  async tryTakeover() {
+    const cfg = this.current()
+    if (!this.coexistingFallback || this.servingRoute === null || this.servingRoute === cfg.route) return
+    try {
+      const providers = await this.ownerCtx.llm.listProviders()
+      const ids = new Set((Array.isArray(providers) ? providers : []).map(entry =>
+        (typeof entry === 'string' ? entry : entry && (entry.id ?? entry.provider))))
+      if (ids.has(cfg.route)) return
+    } catch {
+      return
+    }
+    this.tryRegister()
   }
 
   takeoverState() {
     if (this.servingRoute === DEFAULT_ROUTE) return 'serving'
-    if (this.servingRoute === ALT_ROUTE) return 'own-route'
+    if (this.servingRoute === ALT_ROUTE) return this.coexistingFallback ? 'coexisting' : 'own-route'
     return 'waiting'
   }
 
@@ -713,7 +794,9 @@ export class OpenCodeGoPool extends TypertRemoteService {
 
   /** The card-facing model selector data: catalog entries plus enabled flags. */
   async listAvailableModels(cfg) {
-    const route = this.profileRoute ?? cfg.route
+    // The route this instance actually serves, so the card's catalog is read
+    // from the profile the model picker will resolve against.
+    const route = this.servingRoute ?? cfg.route
     let catalog = []
     try {
       if (this.innerCatalog) catalog = await this.innerCatalog.listModels(route)

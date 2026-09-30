@@ -210,6 +210,48 @@ B. visionModels: ['deepseek-v4.1-flash'] → inputModalities: text+image
 **不涉及**：客户端卡片（`client.js`）与 Typert 严格 schema（`typert.host.js`）未改动 ——
 本参数是纯 host 侧配置项，改 `settings.yaml` 或 bundle patch 即可，无卡片 UI。
 
+## v0.1.20 —— 与官方 `opencode-go` 路由并存（2026-09-30）
+
+**需求**：官方 `opencode-go` 配置和本插件要能**同时存在**，而不是「必须删掉官方行才能接管」。
+
+**旧行为**：`route: opencode-go` 被 `llm-pi-ai` 占着时，插件不注册任何路由，卡片显示
+「等待接管」并提示你去删官方行 —— 二选一。
+
+**新行为**（`index.js`，新增 `routeConflict` 配置）：
+
+```diff
++ routeConflict: z.union(['own-route', 'wait']).default('own-route'),
+```
+
+- `own-route`（新默认）：首选路由被占用时，**注册自有路由 `opencode-go-pool`**，
+  两条路由同时在册 —— 模型选择器里选官方行=官方单 Key，选「OpenCode Zen Go（池）」=走池；
+- `wait`：v0.1.19 及以前的行为（不注册，等对方释放后接管），保留给「只想接管」的部署。
+
+配套三处改动：
+
+1. **profile 按两条路由各建一份**：`applyConfig()` 现在为 `opencode-go` 与
+   `opencode-go-pool` 各建一个 profile（`buildProfile(route, …)` 的 `provider` 字段必须
+   与 map 键一致），否则实际服务的路由在 `innerCatalog` 里查不到 profile；
+2. **释放后自动迁回**（`tryTakeover()`）：并存期间订阅 `llm/adapters-updated`，官方行被
+   删除时把注册迁到 `opencode-go`，**无需重启**。这一条是必要的——反向不迁移（接管后不再
+   降级），因为迁移会让会话里已选中的模型 id 失效；而「官方行删除 → 迁回」正好相反：不迁
+   的话，老会话里指向官方 `opencode-go/*` 的模型会失去 provider。
+   可用性通过 `ctx.llm.listProviders()` 探测，而不是靠捕获注册异常（后者会在官方行存在期间
+   每次拓扑提交都刷一条 warn）；
+3. **卡片新增 `coexisting` 状态**（`client.js` 中英双语）：`并存 · opencode-go 官方路由保留，
+   本插件在 opencode-go-pool 提供池`。
+
+**实测**（隔离虚拟环境，内核 `0.2.0-rc.2`，探针每 4s 打印 `takeoverState()` 与
+`llm.listProviders()`）：
+
+| 阶段 | takeover | 实际服务 | provider 注册表 |
+|---|---|---|---|
+| 官方行存在 | `coexisting` | `opencode-go-pool` | `deepseek-official, deepseek-account, **opencode-go**, **opencode-go-pool**` |
+| 在「设置 → 模型」删除官方行后（未重启） | `serving` | `opencode-go` | `deepseek-official, deepseek-account, **opencode-go**` |
+| `routeConflict: wait` + 官方行存在（回归） | `waiting` | — | `…, opencode-go`（仅官方） |
+
+`smoke.mjs` 21/21、`test/vision.test.mjs` 6/6 均通过。
+
 ## v0.1.17 —— Typert codec 契约迁移：桌面版（nightly）加载失败修复（2026-09-26）
 
 **现象**：DSH 桌面版（nightly 渠道，内置 `dsh-typert-protocol >= 0.1.6`）安装本插件后启动即报：

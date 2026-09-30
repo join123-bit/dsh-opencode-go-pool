@@ -27,6 +27,8 @@ window.__ModuleLoader__.load({
       refresh: '刷新',
       takeoverServing: '服务中 · 路由 opencode-go 已接管',
       takeoverOwnRoute: '自有路由模式 · opencode-go-pool',
+      takeoverCoexisting: '并存 · opencode-go 官方路由保留，本插件在 opencode-go-pool 提供池',
+      takeoverCoexistingHint: '官方 opencode-go 行保持不变，两条路由同时可用：模型选择器里选官方行 = 单 Key，选「OpenCode Zen Go（池）」= 走 Key 池。',
       takeoverWaiting: '等待接管',
       takeoverWaitingHint: 'opencode-go 路由当前由其他插件持有。请在「设置 → 模型」中删除 opencode-go 供应商行，本插件会自动接管，历史会话无需任何改动。',
       noKeysTitle: '尚未配置 Key',
@@ -121,6 +123,8 @@ window.__ModuleLoader__.load({
       refresh: 'Refresh',
       takeoverServing: 'Serving · opencode-go route taken over',
       takeoverOwnRoute: 'Own route mode · opencode-go-pool',
+      takeoverCoexisting: 'Coexisting · official opencode-go route kept, the pool serves on opencode-go-pool',
+      takeoverCoexistingHint: 'The official opencode-go row stays as it is and both routes are available: pick the official row in the model selector for the single key, or “OpenCode Zen Go (pool)” to go through the key pool.',
       takeoverWaiting: 'Waiting for takeover',
       takeoverWaitingHint: 'The opencode-go route is currently owned by another plugin. Remove the opencode-go row under Settings → Models and this plugin takes over automatically — existing conversations keep working unchanged.',
       noKeysTitle: 'No keys configured',
@@ -866,9 +870,13 @@ window.__ModuleLoader__.load({
             React.createElement('div', { style: { ...styles.banner, ...(takeover === 'waiting' ? styles.bannerWarn : styles.bannerOk) } },
               React.createElement('p', { style: { margin: 0, fontWeight: 600 } },
                 takeover === 'serving' ? t('takeoverServing')
-                  : takeover === 'own-route' ? t('takeoverOwnRoute') : t('takeoverWaiting')),
+                  : takeover === 'coexisting' ? t('takeoverCoexisting')
+                    : takeover === 'own-route' ? t('takeoverOwnRoute') : t('takeoverWaiting')),
               takeover === 'waiting'
                 ? React.createElement('p', { style: styles.hint }, data.takeoverHint ? `${t('takeoverWaitingHint')} ${data.takeoverHint}` : t('takeoverWaitingHint'))
+                : null,
+              takeover === 'coexisting'
+                ? React.createElement('p', { style: styles.hint }, t('takeoverCoexistingHint'))
                 : null,
               data.activeId
                 ? React.createElement('p', { style: styles.hint },

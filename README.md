@@ -113,7 +113,8 @@ Authorization: Bearer <OpenCode Go API Key>
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `route` | `opencode-go` | 接管官方路由；改为 `opencode-go-pool` 时注册自有路由（与官方并存，模型选择器需手动切换一次） |
+| `route` | `opencode-go` | 首选路由：官方路由空闲时接管它 |
+| `routeConflict` | `own-route` | 首选路由被别的插件占用时怎么办：`own-route`=**注册自有路由 `opencode-go-pool`，与官方并存**；`wait`=不注册，等对方释放后自动接管 |
 | `keys` | `[]` | Key 列表：`{id, label, apiKeyEnv}`；通常留空由卡片管理 |
 | `preemptAtPercent` | `100` | 5h 滚动用量达到该百分比即主动避让；100 = 仅在失败时切换 |
 | `modelMode` | `all` | `all`=暴露官方目录全部模型（新模型自动可用）；`custom`=仅暴露 `models` 勾选的模型 |
@@ -182,6 +183,21 @@ curl -s https://opencode.ai/zen/go/v1/chat/completions \
 
 能准确读出图片里**特定**的文字/颜色 = 真识图；报 400 = 不支持；答「看不到图片」= 静默忽略。
 只有第一类才写进 `visionModels`。
+
+## 与官方 `opencode-go` 路由并存（v0.1.20+）
+
+默认 `routeConflict: own-route`：**不需要删除官方 `opencode-go` 供应商行**。
+
+| 场景 | 行为 | 卡片状态 |
+|---|---|---|
+| 官方行存在（`llm-pi-ai` 持有 `opencode-go`） | 池注册自有路由 `opencode-go-pool`，两条路由同时在册 | `并存 · opencode-go 官方路由保留…` |
+| 之后删掉官方行 | `llm/adapters-updated` 后自动迁回 `opencode-go`，**无需重启**；老会话里指向官方模型的会话因此不会失去 provider | `服务中 · 路由 opencode-go 已接管` |
+| 一开始就没有官方行 | 直接接管 `opencode-go` | `服务中 · …` |
+| 设 `routeConflict: wait` | 旧行为：不注册，等官方行被删除后接管 | `等待接管` |
+
+模型选择器里两条供应商都能选：选官方行 = 官方单 Key；选 **OpenCode Zen Go（池）** = 走 Key 池（额度耗尽自动换 Key）。
+
+> 只有**首选路由被占用**时才走并存；一旦接管了 `opencode-go` 就不会再被降级——迁移只发生在「自有路由 → 官方路由释放」这一个方向，因为反方向会让会话已选中的模型 id 失效。
 
 ## 与其他插件的关系
 
@@ -254,7 +270,7 @@ DSH 目前只有 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-settings` / `
 | 0.1.2-rc.1 | 0.1.10 / 0.1.11 | ✅（0.1.11 起） | ✅ Windows 实测 | ✅ Windows 实测 | `settingsNamespace` 补丁基线；macOS 待复测 |
 | 0.1.5-rc.1 | 0.1.15 | ✅ | ✅ macOS 实测 | ✅ macOS 实测 | 模型选择器 `resolveModel()` 曾因 profile 缺 `modelErrors` 报“加载失败”；0.1.15 修复并加回归守卫 |
 | 桌面 nightly（`dsh-typert-protocol ≥ 0.1.6`） | 0.1.18 | ✅ host loader + 客户端注册表契约校验（asar 内真实代码逐字对照） | 待桌面实测 | 待桌面实测 | 曾报「卡片加载失败」（客户端 codec 无 `create()`）；0.1.17 修 host 侧、0.1.18 修客户端侧并同步 peer 范围 |
-| 0.2.0-rc.2（桌面版 + `@deepseek-ai/dsh@0.2.0-rc.2`） | **0.1.19** | ✅ `smoke.mjs` 21/21 | ✅ 隔离虚拟环境实测（接管后暴露 30 个模型） | ✅ Playwright 真实 Web UI：卡片渲染、Key 增删、策略保存、宿主重启后持久化，0 控制台错误 | 修 3 处：peer 范围导致**装不上**、`settings.register` 移除导致**静默休眠**、远程调用 `this.ctx` 遮蔽导致**写错条目** |
+| 0.2.0-rc.2（桌面版 + `@deepseek-ai/dsh@0.2.0-rc.2`） | **0.1.20** | ✅ `smoke.mjs` 21/21 | ✅ 隔离虚拟环境实测（接管后暴露 30 个模型） | ✅ Playwright 真实 Web UI：卡片渲染、Key 增删、策略保存、宿主重启后持久化，0 控制台错误 | 修 3 处：peer 范围导致**装不上**、`settings.register` 移除导致**静默休眠**、远程调用 `this.ctx` 遮蔽导致**写错条目**；0.1.20 起与官方路由**并存**（`routeConflict`） |
 | 0.1.3-alpha.* | 未适配 | ⚠️ 升级前先跑 `smoke.mjs` | — | — | 探针会把它打成休眠而非崩溃 |
 
 每次 DSH 升级后更新此表：新版本号 → 跑 smoke → 适配 → 记录结果。

@@ -61,7 +61,8 @@ export const name = 'opencode-go-pool'
  *   - module level: the imported classes/functions exist and return sane
  *     shapes (no ctx needed, reused by smoke.mjs);
  *   - service level: the runtime still exposes llm.registerAdapter /
- *     settings.register / credentials.resolve.
+ *     credentials.resolve, and (DSH >= 0.2.0-rc.1) the configEditor service
+ *     used to persist configuration.
  * A failed probe turns the plugin dormant: nothing is registered, nothing
  * crashes, the reason is logged and surfaced through status().takeoverHint
  * (the Settings card shows it), so a DSH upgrade degrades the plugin into a
@@ -118,9 +119,15 @@ export function selfCheck(ctx) {
   if (!llm || typeof llm.registerAdapter !== 'function') {
     issues.push('llm service: registerAdapter missing (llm absent or renamed)')
   }
+  // Settings moved twice: <= 0.1.x exposed a `settings.register()` scope, and
+  // 0.2.0-rc.1 replaced it with `SettingsForms.configure()/describe()` over the
+  // profile entry itself. The plugin now reads its configuration from its own
+  // Fiber config and writes it through the configEditor service, so a settings
+  // service is no longer an integration point — only presence of *neither* API
+  // (a renamed service) is worth reporting.
   const settings = ctx?.get ? ctx.get('settings') : ctx?.settings
-  if (!settings || typeof settings.register !== 'function') {
-    issues.push('settings service: register missing (settings absent or renamed)')
+  if (settings && typeof settings.register !== 'function' && typeof settings.configure !== 'function') {
+    issues.push('settings service: neither register() nor configure() present (settings renamed)')
   }
   const credentials = ctx?.get ? ctx.get('credentials') : ctx?.credentials
   if (credentials && typeof credentials.resolve !== 'function') {
@@ -129,7 +136,6 @@ export function selfCheck(ctx) {
   return issues
 }
 
-const NS = 'opencode-go-pool'
 const DISPLAY_NAME = 'OpenCode Zen Go（池）'
 const DEFAULT_ROUTE = 'opencode-go'
 const ALT_ROUTE = 'opencode-go-pool'
@@ -406,6 +412,17 @@ export class OpenCodeGoPool extends TypertRemoteService {
   constructor(ctx, config) {
     super(ctx, 'opencodePool')
     this.ctx = ctx
+    // `this.ctx` is not stable across a Typert Remote call: the Gateway invokes
+    // a Remote method in a call-derived Context, which shadows this service's
+    // own `ctx` for the duration of the call. Reading `this.ctx.fiber.entry`
+    // inside `putKeys()` therefore resolved to the *gateway's* profile entry
+    // (`typert-gateway`, i.e. @deepseek-ai/dsh-api-gateway) and the written
+    // configuration row landed there instead of on this plugin's own entry.
+    // The constructor argument is the plugin's own context — keep it, and use
+    // it for every operation that must be owned by this plugin (entry lookup,
+    // adapter registration, credential access).
+    this.ownerCtx = ctx
+    this.entry = ctx.fiber?.entry ?? null
     this.logger = ctx.logger ?? console
 
     // Probe every integration point before touching any registry. A failed
@@ -422,18 +439,38 @@ export class OpenCodeGoPool extends TypertRemoteService {
       this.logger?.warn?.(`[opencode-go-pool] integration probe failed — plugin stays dormant: ${this.integrationIssues.join('; ')}`)
     }
 
+    // ---- configuration source (DSH >= 0.2.0-rc.1) --------------------------
+    // 0.2.0-rc.1 removed `settings.register()`: a plugin's configuration is
+    // now its own profile entry. `config` is the value Cordis resolved for
+    // this Fiber (plain, defaults applied; volatile fields arrive as refs),
+    // and a change is persisted through the configEditor service, which
+    // rewrites the profile entry and restarts this plugin with the new config.
+    // `configOverride` keeps a write effective in the window before that
+    // restart lands, which is what the old `scope.watch()` used to cover.
+    this.reactiveConfig = config ?? {}
+    this.configOverride = null
+    this.writeChain = Promise.resolve()
+    this.configEditor = ctx.get ? ctx.get('configEditor') : undefined
+    this.current = () => this.resolvedConfig()
     this.scope = null
-    this.current = () => ({})
+
+    // The plugin ships its own settings card (「OpenCode Go 套餐池」), so opt out
+    // of the shell's auto-generated form for this entry. Purely presentational:
+    // a runtime without the settings service still reads and writes config.
     try {
-      this.scope = ctx.settings.register(NS, Config, {
-        base: config ?? {},
-        validate: validateSection,
+      ctx.inject?.(['settings'], (child) => {
+        child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
       })
-      this.current = () => this.scope.get()
     } catch (error) {
-      this.integrationIssues.push(`settings.register threw: ${String((error && error.message) || error)}`)
+      this.logger?.warn?.(`[opencode-go-pool] settings presentation unavailable: ${String((error && error.message) || error)}`)
+    }
+
+    try {
+      validateSection(this.current())
+    } catch (error) {
+      this.integrationIssues.push(`configuration rejected: ${String((error && error.message) || error)}`)
       this.dormant = true
-      this.logger?.warn?.(`[opencode-go-pool] settings namespace unavailable — plugin stays dormant: ${this.integrationIssues.join('; ')}`)
+      this.logger?.warn?.(`[opencode-go-pool] invalid configuration — plugin stays dormant: ${this.integrationIssues.join('; ')}`)
     }
 
     this.pool = new KeyPool({
@@ -466,7 +503,6 @@ export class OpenCodeGoPool extends TypertRemoteService {
     if (this.dormant) return
 
     this.applyConfig()
-    this.scope.watch(() => this.applyConfig())
     this.offAdaptersUpdated = ctx.on('llm/adapters-updated', () => {
       if (this.servingRoute === null) this.tryRegister()
     })
@@ -474,6 +510,67 @@ export class OpenCodeGoPool extends TypertRemoteService {
   }
 
   // ---- configuration & registration ---------------------------------------
+
+  /**
+   * Plain snapshot of the effective configuration, schema defaults applied.
+   *
+   * Cordis hands a class plugin the config it resolved for this Fiber: plain
+   * fields by value, volatile fields as refs. Re-running the schema is what
+   * fills in fields the profile entry never wrote, so `writeConfig()` can
+   * persist one complete row without dropping keys it does not touch.
+   */
+  resolvedConfig() {
+    const read = value => (value && typeof value.get === 'function' ? value.get() : value)
+    const raw = {}
+    for (const [key, value] of Object.entries(this.reactiveConfig ?? {})) raw[key] = read(value)
+    const resolved = Config(raw)
+    return { ...resolved, ...(this.configOverride ?? {}) }
+  }
+
+  /**
+   * Persist a configuration change through the configEditor service — the same
+   * seam the built-in Models page writes through, and since 0.2.0-rc.1 the only
+   * one: the plugin's own profile row is the single source of truth.
+   *
+   * The write rewrites that row in the profile's `cordis.patch.yml` and the
+   * Loader restarts this plugin with the new config. `configOverride` +
+   * `applyConfig()` make the change effective immediately, so a status read
+   * right after a write already reports the new state.
+   */
+  async writeConfig(patch) {
+    const editor = this.configEditor ?? this.ownerCtx.get?.('configEditor')
+    // The plugin's own entry, captured at construction: `this.ctx` is call-derived
+    // inside a Remote method and would name the caller's entry instead.
+    const entry = this.entry ?? this.ownerCtx.fiber?.entry
+    if (!editor || typeof editor.edit !== 'function' || entry === undefined) {
+      throw new Error('configuration editor unavailable — this runtime cannot persist plugin configuration (DSH >= 0.2.0-rc.1 writes the profile entry through the configEditor service)')
+    }
+    // A write runs one HMR transaction: it rewrites the profile entry and the
+    // Loader restarts this plugin with the new config. Two overlapping writes —
+    // double-clicked card actions — are refused with "HMR transactions cannot be
+    // nested", and a write issued while this instance's own restart settles hits
+    // the same refusal. So writes queue per instance, and a nesting refusal
+    // retries once after the running transaction drains.
+    const run = async () => {
+      // Base is read at execution time so queued writes accumulate: the first
+      // one's result lands in `configOverride`, which `resolvedConfig()` merges.
+      const next = { ...this.resolvedConfig(), ...patch }
+      validateSection(next)
+      try {
+        await editor.edit(entry, () => next)
+      } catch (error) {
+        if (!/HMR transactions cannot be nested/i.test(String((error && error.message) || error))) throw error
+        await new Promise(resolve => setTimeout(resolve, 250))
+        await editor.edit(entry, () => next)
+      }
+      this.configOverride = next
+      this.applyConfig()
+    }
+    const queued = this.writeChain.then(run, run)
+    this.writeChain = queued.then(() => {}, () => {})
+    await queued
+    return true
+  }
 
   applyConfig() {
     const cfg = this.current()
@@ -496,7 +593,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
         resolveApiKey: async () => {
           throw new Error('opencode-go-pool: the catalog adapter never resolves keys')
         },
-        resolveAttachments: () => this.ctx.get('attachments'),
+        resolveAttachments: () => this.ownerCtx.get('attachments'),
       })
     }
     if (!this.poolAdapter) this.poolAdapter = new OpenCodeGoPoolAdapter(this)
@@ -556,7 +653,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
     if (this.servingRoute === route) return
     try {
       if (this.registration === null) {
-        this.registration = this.ctx.llm.registerAdapter([route], this.poolAdapter)
+        this.registration = this.ownerCtx.llm.registerAdapter([route], this.poolAdapter)
       } else {
         this.registration.replace([route])
       }
@@ -584,7 +681,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
       adapter = new PiAiAdapter({
         profiles: () => this.profileMap,
         resolveApiKey: () => this.resolveKeyValue(entry),
-        resolveAttachments: () => this.ctx.get('attachments'),
+        resolveAttachments: () => this.ownerCtx.get('attachments'),
       })
       this.attemptAdapterCache.set(entry.id, adapter)
     }
@@ -593,7 +690,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
 
   /** Resolve one key's credential reference through the credentials seam. */
   async resolveKeyValue(entry) {
-    const credentials = this.ctx.get('credentials')
+    const credentials = this.ownerCtx.get('credentials')
     const ref = credentialRef(entry.apiKeyEnv)
     let hit
     if (credentials) {
@@ -771,7 +868,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
 
   async putKeys(keys) {
     assertKeyList(keys)
-    await this.scope.update({ keys })
+    await this.writeConfig({ keys })
     return true
   }
 
@@ -787,7 +884,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
     if (typeof secret !== 'string' || secret.trim().length === 0) {
       throw new Error(`key "${id}" needs a non-empty secret`)
     }
-    const credentials = this.ctx.get('credentials')
+    const credentials = this.ownerCtx.get('credentials')
     if (!credentials || typeof credentials.set !== 'function') {
       throw new Error('no credentials service is mounted — set the key through the credentials page instead')
     }
@@ -829,7 +926,7 @@ export class OpenCodeGoPool extends TypertRemoteService {
     if (effective.modelMode === 'custom' && (!Array.isArray(effective.models) || effective.models.length === 0)) {
       throw new Error('custom model selection needs at least one model — pick models or use modelMode "all"')
     }
-    await this.scope.update(patch)
+    await this.writeConfig(patch)
     return true
   }
 

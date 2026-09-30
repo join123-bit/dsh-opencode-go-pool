@@ -208,9 +208,9 @@ node --test test/*.test.mjs
 
 ## 稳定性：升级 DSH 后怎么办
 
-DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-settings` / `dsh-llm-pi-ai` 等）随时可能改名、删名或改形。本仓库 **v0.1.11 起**内置**集成点探针 + 休眠降级**：
+DSH 目前只有 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-settings` / `dsh-llm-pi-ai` 等）随时可能改名、删名或改形。本仓库 **v0.1.11 起**内置**集成点探针 + 休眠降级**：
 
-- 启动时先探测所有依赖的 DSH 接口：模块导入、`opencodeGoProvider()` / `PiAiAdapter` 构造契约、`llm` / `settings` / `credentials` 服务方法；
+- 启动时先探测所有依赖的 DSH 接口：模块导入、`opencodeGoProvider()` / `PiAiAdapter` 构造契约、`llm` / `credentials` 服务方法；
 - 探测失败 → 插件**休眠**：不接管路由、不抛错、官方单 Key 路由照常服务；原因写入日志，并显示在设置卡片的 `takeoverHint` 上；
 - 这样 DSH 升级对插件的影响从"启动即崩 / 拖垮 host"降级为"可见的休眠状态"。
 - **v0.1.15 起**探针之外再加一层 `smoke.mjs` 的 profile 契约校验：`buildProfile()` 手写的 profile
@@ -225,6 +225,15 @@ DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-s
     不满足表现为卡片「加载失败: typert: … result strict codec has no create() factory」
     —— v0.1.18 修复，`smoke.mjs` 第 7 项做源形状守卫。
   升级 DSH 后若插件或卡片加载失败，先对照这两个文件的 codec 形状。
+- **v0.1.19 起**适配 `0.2.0-rc.1+` 的设置模型：
+  - peer 范围统一为 `>=0.1.0-rc.5 <0.3.0-0`（一条范围覆盖 `0.1.x-rc` 与 `0.2.0-rc.x`，
+    下界预发布 + 上界 `-0` 才能让预发布版本参与判断）；范围不对时 **`dsh plugin add`
+    会直接拒绝安装**，而不是装上去再出问题；
+  - `settings.register()` 已移除 → 配置读写改走 **Fiber config + `configEditor.edit()`**
+    （写入 profile 的 `cordis.patch.yml`，Loader 随后带新配置重启插件）；
+  - 远程方法内 `this.ctx` 会被 Typert Gateway 的**调用派生上下文**遮蔽，解析出的 profile
+    条目是**调用方**的（曾把配置写进 `@deepseek-ai/dsh-api-gateway` 的条目）；
+    本插件在构造期固化 `ownerCtx` / `entry` 后不再受影响 —— 其他插件作者请注意同一坑。
 
 ### 升级 DSH 后的三步检查
 
@@ -245,6 +254,7 @@ DSH 目前只有 `0.1.x` 的 rc/alpha 发布，插件契约（`dsh-llm` / `dsh-s
 | 0.1.2-rc.1 | 0.1.10 / 0.1.11 | ✅（0.1.11 起） | ✅ Windows 实测 | ✅ Windows 实测 | `settingsNamespace` 补丁基线；macOS 待复测 |
 | 0.1.5-rc.1 | 0.1.15 | ✅ | ✅ macOS 实测 | ✅ macOS 实测 | 模型选择器 `resolveModel()` 曾因 profile 缺 `modelErrors` 报“加载失败”；0.1.15 修复并加回归守卫 |
 | 桌面 nightly（`dsh-typert-protocol ≥ 0.1.6`） | 0.1.18 | ✅ host loader + 客户端注册表契约校验（asar 内真实代码逐字对照） | 待桌面实测 | 待桌面实测 | 曾报「卡片加载失败」（客户端 codec 无 `create()`）；0.1.17 修 host 侧、0.1.18 修客户端侧并同步 peer 范围 |
+| 0.2.0-rc.2（桌面版 + `@deepseek-ai/dsh@0.2.0-rc.2`） | **0.1.19** | ✅ `smoke.mjs` 21/21 | ✅ 隔离虚拟环境实测（接管后暴露 30 个模型） | ✅ Playwright 真实 Web UI：卡片渲染、Key 增删、策略保存、宿主重启后持久化，0 控制台错误 | 修 3 处：peer 范围导致**装不上**、`settings.register` 移除导致**静默休眠**、远程调用 `this.ctx` 遮蔽导致**写错条目** |
 | 0.1.3-alpha.* | 未适配 | ⚠️ 升级前先跑 `smoke.mjs` | — | — | 探针会把它打成休眠而非崩溃 |
 
 每次 DSH 升级后更新此表：新版本号 → 跑 smoke → 适配 → 记录结果。

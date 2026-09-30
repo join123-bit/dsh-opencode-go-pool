@@ -22,6 +22,7 @@
 import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { existsSync, readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { PiAiAdapter } from '@deepseek-ai/dsh-llm-pi-ai'
 import { opencodeGoProvider } from '@earendil-works/pi-ai/providers/opencode-go'
 import { probeCoreImports, Config, buildProfile } from './index.js'
@@ -42,10 +43,12 @@ function packageVersion(pkg) {
     entry = require.resolve(pkg)
   } catch {
     // ESM-first packages reject CJS resolution (ERR_PACKAGE_PATH_NOT_EXPORTED);
-    // resolve through the import condition instead.
+    // resolve through the import condition instead. fileURLToPath, not a string
+    // strip: an install path with non-ASCII characters (e.g. ~/存储/AI_code)
+    // arrives percent-encoded and every existsSync() below would miss.
     if (typeof import.meta.resolve === 'function') {
       try {
-        entry = import.meta.resolve(pkg).replace(/^file:\/\//, '')
+        entry = fileURLToPath(import.meta.resolve(pkg))
       } catch {
         entry = null
       }

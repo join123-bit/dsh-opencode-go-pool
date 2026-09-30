@@ -1,7 +1,8 @@
-# dsh-opencode-go-pool —— DSH 0.1.2 兼容补丁版
+# dsh-opencode-go-pool —— DSH rc 线兼容补丁版
 
 本仓库是 [whitelonng/dsh-opencode-go-pool](https://github.com/whitelonng/dsh-opencode-go-pool)（MIT 协议）v0.1.10
-的 **0.1.2-rc.x 兼容补丁版**，用于个人/团队自用。功能与上游一致：
+的 **rc 线兼容补丁版**，用于个人/团队自用。当前适配 **DSH 0.1.2-rc.x ~ 0.2.0-rc.2**
+（peer 范围 `>=0.1.0-rc.5 <0.3.0-0`）。功能与上游一致：
 
 OpenCode Go 套餐的多 Key 池 —— 当前 Key 额度耗尽（`QUOTA`）或凭据失效（401/403）时，
 在同一次流式调用内静默切换到下一个 Key 重发，对话零感知；提供设置页套餐用量卡片
@@ -313,6 +314,158 @@ node 里 import，改为**源形状守卫**：断言 codec helper 带 `create:`�
   `validateCodec` 逻辑）逐字对照：修复后 `create` 存在、校验通过；v0.1.17 的旧形状
   恰好触发你贴出的那句报错（`typert: <endpoint> result strict codec has no create() factory`）；
 - 桌面实测：冷启动后设置卡片正常渲染、`status()` 与 Key 操作可用（待填实测结果）。
+
+## v0.1.19 —— DSH 0.2.0-rc.2 适配：settings.register 已移除 + 写入落到错误条目（2026-09-30）
+
+在桌面版 **0.2.0-rc.2**（内核 `@deepseek-ai/*@0.2.0-rc.2`）的**隔离虚拟环境**里复现、
+修复并逐项实测。三处独立故障，任何一处都足以让插件“炸掉”：
+
+### 1. 安装即被拒：peer 范围与 0.2.0 不兼容
+
+**现象**（`dsh plugin add` 直接失败，插件根本没装上）：
+
+```
+dsh: installation rejected: Plugin dsh-opencode-go-pool@0.1.18 is incompatible with dsh 0.2.0-rc.2:
+peerDependencies {"@deepseek-ai/dsh-typert-protocol":"^0.1.7-rc.2",
+"@deepseek-ai/dsh-credentials":"^0.1.0-rc.5", …}
+```
+
+**根因**：`dsh-app-boot` 的 `evaluatePluginCompatibility()` 逐个校验
+`@deepseek-ai/dsh*` peer：
+
+```js
+semver.satisfies(runtimeVersion, requirement, { includePrerelease: true })
+```
+
+`^0.1.0-rc.5` 展开为 `>=0.1.0-rc.5 <0.2.0`，`0.2.0-rc.2` 落在 `<0.2.0` **之外**；
+而 v0.1.17 把 typert-protocol 收紧到 `^0.1.7-rc.2`，连 0.2 线都够不着。
+
+**修复**（`package.json`，6 个 peer 全部改为）：
+
+```diff
+- "@deepseek-ai/dsh-typert-protocol": "^0.1.7-rc.2",
++ "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-rc.5 <0.3.0-0",
+```
+
+`<0.3.0-0` 的上界写法（而不是 `<0.3.0`）是为了让**预发布版本参与区间判断**：
+实测该范围同时匹配 `0.1.0-rc.5 / 0.1.2-rc.1 / 0.1.5-rc.3 / 0.1.7-rc.2 / 0.2.0-rc.1 /
+0.2.0-rc.2 / 0.2.0 / 0.2.1`，并排除 `0.3.0`——一条范围覆盖两条内核线，不必随 rc 反复改。
+
+### 2. `settings.register()` 在 0.2.0-rc.1 被移除 → 插件静默休眠
+
+**现象**：安装通过、宿主正常启动、**没有任何报错**，但池功能全废（不接管路由）。
+启动日志里只有两行 warn：
+
+```
+[opencode-go-pool] integration probe failed — plugin stays dormant:
+  settings service: register missing (settings absent or renamed)
+[opencode-go-pool] settings namespace unavailable — plugin stays dormant: …;
+  settings.register threw: ctx.settings.register is not a function
+```
+
+**根因**：0.2.0-rc.1 把设置模型换成 `SettingsForms`（`configure()/describe()`）：
+插件配置现在**就是它自己的 profile 条目**，读写走「Fiber config + configEditor 服务」，
+不再有 `settings.register()` 返回的 scope。
+
+**修复**（`index.js`）：
+
+```diff
+- this.scope = ctx.settings.register(NS, Config, { base: config ?? {}, validate: validateSection })
+- this.current = () => this.scope.get()
+- this.scope.watch(() => this.applyConfig())
++ this.current = () => this.resolvedConfig()      // Fiber config + 写后覆盖层
+…
+- await this.scope.update({ keys })
++ await this.writeConfig({ keys })
+```
+
+- `resolvedConfig()`：读取构造期拿到的 Fiber config（volatile 字段是 ref，用 `.get()`），
+  再回灌一次 `Config(raw)` 补齐条目里没写的字段——这样一次写入能持久化**完整一行**，
+  不会把没碰过的键写丢；
+- `writeConfig(patch)`：经 `ctx.get('configEditor').edit(entry, () => next)` 写入
+  profile 的 `cordis.patch.yml`（与内置「设置 → 模型」页同一条缝），Loader 随即带新配置
+  重启插件；写后先落到 `configOverride` 并立即 `applyConfig()`，重启落地前就已生效；
+- 写入**串行化**并识别 `HMR transactions cannot be nested` 重试一次（一次写入 = 一个 HMR
+  事务，连点两次卡片动作会撞上）；
+- 另加 `ctx.inject(['settings'], child => child.settings.configure({ auto: false }, ctx.fiber))`，
+  与 `llm-pi-ai` 一致：抑制外壳为插件条目自动生成的表单（卡片是插件自己的）。
+
+### 3. 配置写到了**别的插件**头上：远程调用里 `this.ctx` 会被调用派生上下文遮蔽 ★
+
+**现象**（v0.1.19 前两处修好后暴露）：卡片操作看似成功，但 profile 文件里长出来的是：
+
+```yaml
+- id: typert-gateway                    # ← 应该是 opencode-go-pool！
+  name: "@deepseek-ai/dsh-api-gateway"
+  config:
+    route: opencode-go
+    keys: [ … ]
+```
+
+**根因**：Typert Gateway 调用 Remote 方法时会创建一个**调用派生 Context**，
+它遮蔽了 Service 自己的 `ctx`——于是 `this.ctx.fiber.entry` 在远程方法里指向
+**网关的条目**。诊断输出把两件事同时钉死：
+
+```
+[DIAG] ctorEntry=opencode-go-pool callEntry=typert-gateway ctxIsOwn=false
+```
+
+**修复**（`index.js`）：构造期固化插件自身上下文与条目，凡「必须属于本插件」的操作
+（条目查找、adapter 注册、凭据访问）一律用固化值：
+
+```diff
+  super(ctx, 'opencodePool')
++ this.ownerCtx = ctx
++ this.entry = ctx.fiber?.entry ?? null
+…
+- const entry = this.ctx.fiber?.entry
++ const entry = this.entry ?? this.ownerCtx.fiber?.entry
+- this.registration = this.ctx.llm.registerAdapter([route], this.poolAdapter)
++ this.registration = this.ownerCtx.llm.registerAdapter([route], this.poolAdapter)
+```
+
+### 4. `smoke.mjs`：非 ASCII 安装路径下的假失败
+
+`packageVersion()` 用 `import.meta.resolve(pkg).replace(/^file:\/\//, '')` 取路径——
+`file://` 剥离后仍是**百分号转义**形式，路径里含中文（`~/存储/AI_code/…`）时
+`existsSync` 全部落空，于是 `@earendil-works/pi-ai` 被误报成
+`package not found from this location`。改用 `fileURLToPath()`：
+
+```diff
+- entry = import.meta.resolve(pkg).replace(/^file:\/\//, '')
++ entry = fileURLToPath(import.meta.resolve(pkg))
+```
+
+> 旧版之所以没暴露：`@deepseek-ai/*` 能走 `require.resolve` 分支，只有
+> `@earendil-works/pi-ai`（exports 无 `require` 条件）才会落到 ESM 兜底分支。
+
+### 验证（全部在隔离虚拟环境，DSH 0.2.0-rc.2）
+
+用 `@deepseek-ai/dsh@0.2.0-rc.2`（npm `latest`，与桌面版内核同版本）建独立
+`DSH_HOME`，`dsh plugin --profile web add file:<checkout>` 真实安装后：
+
+| 验证项 | 结果 |
+|---|---|
+| `dsh plugin add` | 通过（不再被 peer 门槛拒绝），bundle 自动挂载 |
+| 宿主启动 | 无插件错误；`typert-loader` 成功导入 `./typert`（zod 解析） |
+| `smoke.mjs` | **21/21 PASS**（含 `create()` 契约、profile 契约、vision、客户端 codec 形状守卫） |
+| 路由接管 | `status().takeover = "serving"`，`opencode-go` 已接管，暴露 30 个模型 |
+| 浏览器端到端 | Playwright 打开真实 Web UI：卡片渲染正常（**不再「加载失败」**）、0 控制台错误 |
+| Key 新增（UI） | `putKeys` → 写入 `cordis.patch.yml` 的 `- id: opencode-go-pool`、自动生成凭据引用、`in use`、401 检测生效 |
+| 策略保存（UI） | `preempt=85 / consec=3` 保存后刷新仍在 |
+| 宿主重启 | 配置与 Key 全部保留，路由继续接管 |
+| 反例（修复前） | 同一条旅程写入落在 `- id: typert-gateway`，即上面的第 3 条 |
+
+### 已知迁移事项（升级到 v0.1.19 必读）
+
+- **Key 列表搬家了**：旧版的 Key 存在设置文档的 `opencode-go-pool` 节
+  （`$DSH_HOME/settings.yaml`，被 0.2.0 重命名为 `settings.yaml.imported`），
+  新版存进 profile 的 `cordis.patch.yml` 条目。升级后卡片初始会是空的，
+  需要把 `settings.yaml.imported` 里 `opencode-go-pool: keys:` 的三元组
+  （`id` / `label` / `apiKeyEnv`）照抄到新条目，或在卡片里重新添加一遍
+  （**Key 明文仍在凭据库里，不用重新粘贴**）。
+- **`apiKeyEnv` 引用名不能忘**：密钥明文始终在
+  `$DSH_HOME/.credentials.yaml` / 环境变量里，插件配置只存引用名。
 
 ## 安装（DSH）
 
